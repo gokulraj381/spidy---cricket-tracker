@@ -1,4 +1,4 @@
-# ESP32-C3 LED Matrix: scrolling text, animated eyes, countdown bar and a break nagger
+# Reed: an ESP32-C3 LED matrix with scrolling text, animated eyes, a countdown bar and a break nagger
 
 A tiny desk gadget built from an **ESP32-C3** and a **4-module MAX7219 LED matrix** (32 x 8 red dots). It makes its own Wi-Fi network, so you control it from your phone with no app and no router. Over the USB cable it can also nag you to take a break when you have been at the PC too long.
 
@@ -107,8 +107,8 @@ You should see something like `PlatformIO Core, version 6.x`. If the command is 
 
 ```bash
 # 1. Download the project
-git clone https://github.com/<your-github-username>/ESP32C3-LED-MATRIX.git
-cd ESP32C3-LED-MATRIX
+git clone https://github.com/gokulraj381/Reed.git
+cd Reed
 
 # 2. Build (the first time takes a few minutes while the toolchain downloads)
 pio run
