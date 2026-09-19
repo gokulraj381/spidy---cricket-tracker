@@ -6,7 +6,7 @@ A tiny desk gadget built from an **ESP32-C3** and a **4-module MAX7219 LED matri
 
 | Feature | What you see |
 |---------|--------------|
-| 🔤 Scrolling text | Any message you type, at any speed |
+| 🔤 Text | Any message you type. Short words sit still and centred, longer text scrolls at the speed you choose |
 | 👀 Animated eyes | Two eyes that look left, look right and blink |
 | ⏳ Countdown timer | Stand the strip upright: it fills up LED by LED and is full exactly when time is up, then flashes |
 | 💻 Break monitor | A script on your PC watches your keyboard and mouse. After 15 minutes of work the matrix flashes and scrolls *BITCH TAKE A BREAK* until you walk away for 3 minutes |
@@ -169,7 +169,7 @@ If the self-test looks wrong on the strip, jump to [Troubleshooting the display]
 
 | Card | What to do |
 |------|------------|
-| **ESP32 LED Matrix Control** | Type a message, pick a scroll speed (10 to 500 ms per step), tap *Display Message*. |
+| **ESP32 LED Matrix Control** | Type a message, pick a scroll speed (10 to 500 ms per step), tap *Display Message*. Short text that fits on the strip, about five characters such as `BUSY`, is shown still and centred; longer text scrolls. |
 | **Eyes** | Tap *Show Eyes*. The strip lies flat, connector on the right. The pupils glide left, hold two seconds, glide right, and the eyes blink now and then. *Show Text* switches back. Whichever you chose last is the resting screen and comes back after a timer, even after a power cycle. |
 | **Break Monitor** | *Test Alert* shows the break message for 10 seconds. *Dismiss* clears a running alert. The real thing is driven from your PC, see section 7. |
 | **Countdown Timer** | Stand the strip upright with the connector at the bottom. Set minutes and seconds, tap *Start Timer*. The bar fills from the bottom, one LED at a time, over the whole duration, is completely lit when time is up, then flashes for 10 seconds. The page shows a live countdown. If the bar grows downward on your setup, tick *Fill from the other end*. |

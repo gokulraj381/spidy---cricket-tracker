@@ -62,6 +62,7 @@ enum DisplayMode : uint8_t { MODE_TEXT, MODE_TIMER, MODE_DONE, MODE_SELFTEST, MO
 volatile DisplayMode mode = MODE_TEXT;
 char displayText[TEXT_MAX_LEN + 1] = "WELCOME!";
 int  scrollSpeed = 50;
+bool textStatic  = false;   // true when the text fits on the strip and is shown still, centred
 
 unsigned long timerStartMs    = 0;
 unsigned long timerDurationMs = 0;
@@ -1033,12 +1034,14 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
 //  Display helpers (called from loop() only)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Return to normal scrolling text.
+// Show the text: still and centred if it fits on the strip, scrolling otherwise.
 static void startTextMode() {
   mode = MODE_TEXT;
   P.displayClear();
-  P.displayText(displayText, PA_CENTER, scrollSpeed, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
-  Serial.println("Mode: text");
+  textStatic = P.getTextColumns(displayText) <= mx->getColumnCount();
+  if (textStatic) P.displayText(displayText, PA_CENTER, scrollSpeed, 0, PA_PRINT, PA_NO_EFFECT);
+  else            P.displayText(displayText, PA_CENTER, scrollSpeed, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
+  Serial.printf("Mode: text (%s)\n", textStatic ? "still, centred" : "scrolling");
 }
 
 // Light every LED on or off. Used for the end-of-timer flash.
@@ -1767,8 +1770,8 @@ void loop() {
 
   switch (mode) {
     case MODE_TEXT:
-      if (P.displayAnimate()) {
-        P.displayReset();
+      if (P.displayAnimate() && !textStatic) {
+        P.displayReset();     // scrolling text loops; still text just stays
       }
       break;
 
