@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Reed cricket scoreboard simulator</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0d0d10; color: #e8e8ea; font-family: -apple-system, 'Segoe UI', Roboto, sans-serif;
+         min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 2rem 1rem; gap: 1.25rem; }
+  h1 { font-size: 1.3rem; font-weight: 600; }
+  p { color: #9a9aa3; font-size: 0.9rem; max-width: 46rem; text-align: center; line-height: 1.5; }
+  canvas { width: 100%; max-width: 960px; height: auto; background: #000; border-radius: 10px; border: 1px solid #26262c; }
+  .row { display: flex; flex-wrap: wrap; gap: 0.6rem; justify-content: center; max-width: 960px; width: 100%; }
+  button { background: #1d1d24; color: #e8e8ea; border: 1px solid #34343d; border-radius: 8px; padding: 0.6rem 1.1rem;
+           font-size: 0.95rem; cursor: pointer; }
+  button:hover { background: #2a2a34; }
+  button.primary { background: #c62828; border-color: #e53935; }
+  button.primary:hover { background: #d93232; }
+  input[type=text] { flex: 1; min-width: 14rem; background: #16161b; color: #e8e8ea; border: 1px solid #34343d;
+                     border-radius: 8px; padding: 0.6rem 0.8rem; font-size: 0.95rem; font-family: Consolas, monospace; }
+  label { color: #9a9aa3; font-size: 0.85rem; display: flex; align-items: center; gap: 0.4rem; }
+  #state { font-family: Consolas, monospace; font-size: 0.85rem; color: #9a9aa3; }
+</style>
+</head>
+<body>
+  <h1>Reed cricket scoreboard simulator</h1>
+  <p>
+    A browser copy of the cricket drawing code in src/main.cpp, on the same 32 x 8 grid. Use it to
+    preview pages and animations without the board. It is a hand port, so if you change the firmware
+    animations, change them here too.
+  </p>
+
+  <canvas id="led" width="960" height="240"></canvas>
+  <div id="state"></div>
+
+  <div class="row">
+    <button data-e="4">Four</button>
+    <button data-e="6">Six</button>
+    <button data-e="W">Wicket</button>
+    <button data-e="50" data-t="KOHLI 50*">Fifty</button>
+    <button data-e="100" data-t="KOHLI 100*">Hundred</button>
+    <button data-e="WIN" data-t="IND WON BY 5 WICKETS">Win</button>
+    <button class="primary" id="demo">Play demo finish</button>
+  </div>
+
+  <div class="row">
+    <input type="text" id="payload" value="2|IND 187/4|OV 18.2|NEED 24|10 BALLS|KOHLI 72*|PANDYA 31*">
+    <button id="send">Set score</button>
+    <button id="ball">Next ball</button>
+  </div>
+  <div class="row">
+    <label>Speed
+      <select id="speed">
+        <option value="1" selected>1x</option>
+        <option value="0.5">0.5x</option>
+        <option value="0.25">0.25x</option>
+      </select>
+    </label>
+    <label><input type="checkbox" id="pause"> Pause</label>
+  </div>
+  <p>
+    Score format, same as the firmware's <code>q</code> command: balls bowled this over (0 to 6, or
+    <code>-</code> to hide the over row), then pages separated by <code>|</code>.
+  </p>
+
+<script>
+// ENGINE-START  (mirrors the "Cricket scoreboard engine" section of src/main.cpp)
+const CRK_PAGE_MS = 3500, CRK_MAIN_PAGE_MS = 6000, CRK_SCROLL_MS = 45, CRK_SLIDE_MS = 260;
+const CRK_PAGES_MAX = 8, CRK_PAGE_LEN = 39, CRK_QUEUE_MAX = 4;
+const ANIM_NONE = 0, ANIM_FOUR = 1, ANIM_SIX = 2, ANIM_WICKET = 3, ANIM_FIFTY = 4, ANIM_HUNDRED = 5, ANIM_WIN = 6;
+
+const FONT = {
+  ' ': [1, [0, 0, 0, 0, 0]],
+  '0': [3, [0b111, 0b101, 0b101, 0b101, 0b111]], '1': [3, [0b010, 0b110, 0b010, 0b010, 0b111]],
+  '2': [3, [0b111, 0b001, 0b111, 0b100, 0b111]], '3': [3, [0b111, 0b001, 0b111, 0b001, 0b111]],
+  '4': [3, [0b101, 0b101, 0b111, 0b001, 0b001]], '5': [3, [0b111, 0b100, 0b111, 0b001, 0b111]],
+  '6': [3, [0b111, 0b100, 0b111, 0b101, 0b111]], '7': [3, [0b111, 0b001, 0b001, 0b010, 0b010]],
+  '8': [3, [0b111, 0b101, 0b111, 0b101, 0b111]], '9': [3, [0b111, 0b101, 0b111, 0b001, 0b111]],
+  'A': [3, [0b010, 0b101, 0b111, 0b101, 0b101]], 'B': [3, [0b110, 0b101, 0b110, 0b101, 0b110]],
+  'C': [3, [0b011, 0b100, 0b100, 0b100, 0b011]], 'D': [3, [0b110, 0b101, 0b101, 0b101, 0b110]],
+  'E': [3, [0b111, 0b100, 0b110, 0b100, 0b111]], 'F': [3, [0b111, 0b100, 0b110, 0b100, 0b100]],
+  'G': [3, [0b011, 0b100, 0b101, 0b101, 0b011]], 'H': [3, [0b101, 0b101, 0b111, 0b101, 0b101]],
+  'I': [3, [0b111, 0b010, 0b010, 0b010, 0b111]], 'J': [3, [0b001, 0b001, 0b001, 0b101, 0b010]],
+  'K': [3, [0b101, 0b101, 0b110, 0b101, 0b101]], 'L': [3, [0b100, 0b100, 0b100, 0b100, 0b111]],
+  'M': [5, [0b10001, 0b11011, 0b10101, 0b10001, 0b10001]], 'N': [3, [0b101, 0b111, 0b111, 0b111, 0b101]],
+  'O': [3, [0b010, 0b101, 0b101, 0b101, 0b010]], 'P': [3, [0b110, 0b101, 0b110, 0b100, 0b100]],
+  'Q': [3, [0b010, 0b101, 0b101, 0b111, 0b011]], 'R': [3, [0b110, 0b101, 0b110, 0b101, 0b101]],
+  'S': [3, [0b011, 0b100, 0b010, 0b001, 0b110]], 'T': [3, [0b111, 0b010, 0b010, 0b010, 0b010]],
+  'U': [3, [0b101, 0b101, 0b101, 0b101, 0b111]], 'V': [3, [0b101, 0b101, 0b101, 0b101, 0b010]],
+  'W': [5, [0b10001, 0b10001, 0b10101, 0b10101, 0b01010]], 'X': [3, [0b101, 0b101, 0b010, 0b101, 0b101]],
+  'Y': [3, [0b101, 0b101, 0b010, 0b010, 0b010]], 'Z': [3, [0b111, 0b001, 0b010, 0b100, 0b111]],
+  '/': [3, [0b001, 0b001, 0b010, 0b100, 0b100]], '-': [3, [0b000, 0b000, 0b111, 0b000, 0b000]],
+  '+': [3, [0b000, 0b010, 0b111, 0b010, 0b000]], '*': [3, [0b101, 0b010, 0b101, 0b000, 0b000]],
+  '.': [1, [0, 0, 0, 0, 1]], '!': [1, [1, 1, 1, 0, 1]], ':': [1, [0, 1, 0, 1, 0]],
+};
+
+const fb = new Uint8Array(32);         // frame: fb[x] bit y, x left to right, y top to bottom
+const crkText = new Uint8Array(32);
+const crkOldText = new Uint8Array(32);
+let crkPages = [], crkBalls = -1, crkActive = false;
+let crkPage = 0, crkShown = '', crkPageStartMs = 0, crkPageW = 0, crkTight = false, crkMarquee = false;
+let crkSliding = false, crkSlideStartMs = 0, crkWiping = false, crkWipeMs = 0, crkNewBall = false, crkNewBallMs = 0;
+let crkAnim = ANIM_NONE, crkAnimStartMs = 0, crkAnimText = '', crkQueue = [], crkParts = [], crkPartsLive = false;
+
+const random = (a, b) => a + Math.floor(Math.random() * (b - a));
+const round = (v) => Math.sign(v) * Math.round(Math.abs(v));          // like C roundf
+function setPx(layer, x, y) { if (x >= 0 && x < 32 && y >= 0 && y < 8) layer[x] |= (1 << y); }
+function fbSet(x, y) { setPx(fb, x, y); }
+
+function glyph(c) { return FONT[c] ? c : ' '; }
+function crkTextWidth(s, tight) {
+  let w = 0;
+  for (const ch of s) { const c = glyph(ch); w += ((c === ' ') ? (tight ? 0 : 1) : FONT[c][0]) + 1; }
+  return w > 0 ? w - 1 : 0;
+}
+function crkDrawText(layer, s, x, y, tight) {
+  for (const ch of s) {
+    const c = glyph(ch);
+    if (c === ' ') { x += (tight ? 0 : 1) + 1; continue; }
+    const [w, rows] = FONT[c];
+    for (let r = 0; r < 5; r++)
+      for (let col = 0; col < w; col++)
+        if ((rows[r] >> (w - 1 - col)) & 1) setPx(layer, x + col, y + r);
+    x += w + 1;
+  }
+}
+function crkCentered(s, y) { crkDrawText(fb, s, Math.trunc((32 - crkTextWidth(s, false)) / 2), y, false); }
+function crkFill() { fb.fill(0xFF); }
+function crkInvert() { for (let x = 0; x < 32; x++) fb[x] = ~fb[x] & 0xFF; }
+function crkBall(x, y) { const bx = round(x), by = round(y); fbSet(bx, by); fbSet(bx + 1, by); fbSet(bx, by + 1); fbSet(bx + 1, by + 1); }
+
+function crkAnimScroll(t, text) {
+  if (!text) return true;
+  const x = 32 - Math.floor(t / CRK_SCROLL_MS);
+  crkDrawText(fb, text, x, 1, false);
+  return x + crkTextWidth(text, false) < 0;
+}
+
+function crkAnimFour(t) {
+  if (t < 900) {
+    const bx = -2 + 36 * (t / 900);
+    for (let x = 0; x < 32; x++) if (((x + Math.floor(t / 30)) & 3) === 0) fbSet(x, 7);
+    crkBall(bx, 4);
+    for (let i = 1; i <= 4; i++) fbSet(Math.trunc(bx) - 2 * i, 5 - (i & 1));
+  } else if (t < 1020) {
+    crkFill();
+  } else if (t < 1100) {
+  } else if (t < 2900) {
+    const s = t - 1100;
+    const cx = Math.trunc((32 - crkTextWidth('FOUR!', false)) / 2);
+    const x = (s < 220) ? 32 - Math.trunc((32 - cx) * (s / 220)) : cx;
+    crkDrawText(fb, 'FOUR!', x, 1, false);
+    if ((s >= 500 && s < 650) || (s >= 850 && s < 1000)) crkInvert();
+  } else return true;
+  return false;
+}
+
+function crkAnimSix(t) {
+  if (t < 1000) {
+    for (let i = 0; i < 4; i++) {
+      const u = (t - i * 55) / 1000;
+      if (u < 0) continue;
+      const x = 31 * u, y = 6 - 7.5 * u * (2 - u);
+      if (i === 0) crkBall(x, y); else fbSet(round(x), round(y) + 1);
+    }
+  } else if (t < 2300) {
+    const CX = [6, 17, 26], CY = [3, 4, 3];
+    for (let b = 0; b < 3; b++) {
+      const age = t - 1000 - b * 300;
+      if (age < 0 || age > 650) continue;
+      const r = 0.6 + age / 110;
+      if (age < 120) fbSet(CX[b], CY[b]);
+      for (let d = 0; d < 8; d++) {
+        if (age > 400 && (d & 1)) continue;
+        const a = d * 0.7853982;
+        fbSet(round(CX[b] + Math.cos(a) * r * 1.3), round(CY[b] + Math.sin(a) * r * 0.8));
+        if (age > 150 && age < 400) fbSet(round(CX[b] + Math.cos(a) * r * 0.6), round(CY[b] + Math.sin(a) * r * 0.4));
+      }
+    }
+  } else if (t < 3900) {
+    const s = t - 2300, w = crkTextWidth('SIX!', false), x0 = Math.trunc((32 - w) / 2);
+    crkDrawText(fb, 'SIX!', x0, 1, false);
+    for (let i = 0; i < 5; i++) {
+      const x = random(0, 32);
+      if (x >= x0 - 1 && x <= x0 + w) continue;
+      fbSet(x, random(0, 8));
+    }
+    if ((s >= 450 && s < 600) || (s >= 800 && s < 950)) crkInvert();
+  } else return true;
+  return false;
+}
+
+function crkAnimWicket(t) {
+  const STUMP_X = [24, 26, 28];
+  if (t < 700) {
+    for (const sx of STUMP_X) for (let y = 2; y < 8; y++) fbSet(sx, y);
+    fbSet(25, 1); fbSet(27, 1);
+    const bx = -2 + 24 * (t / 700);
+    crkBall(bx, 4);
+    for (let i = 1; i <= 3; i++) fbSet(Math.trunc(bx) - 2 * i, 5 - (i & 1));
+  } else if (t < 1800) {
+    if (!crkPartsLive) {
+      crkPartsLive = true;
+      crkParts = [];
+      for (const sx of STUMP_X) for (let y = 2; y < 8; y++)
+        crkParts.push({ x: sx, y: y, vx: random(-90, 60) / 100, vy: -random(10, 110) / 100 });
+      crkParts.push({ x: 25, y: 1, vx: -0.5, vy: -2.0 });
+      crkParts.push({ x: 27, y: 1, vx: 0.7, vy: -2.2 });
+    }
+    if (t < 790) crkFill();
+    for (const p of crkParts) {
+      p.x += p.vx; p.y += p.vy; p.vy += 0.09;
+      if (t >= 790) fbSet(round(p.x), round(p.y));
+    }
+  } else if (t < 3700) {
+    crkCentered('OUT!', 1);
+    if (Math.floor((t - 1800) / 240) & 1) crkInvert();
+  } else return true;
+  return false;
+}
+
+function crkAnimMilestone(t, hundred) {
+  const label = hundred ? '100!' : '50!';
+  if (t < 900) {
+    const n = 4 + Math.floor(t / 60);
+    for (let i = 0; i < n; i++) fbSet(random(0, 32), random(0, 8));
+  } else if (t < 2900) {
+    const s = t - 900, w = crkTextWidth(label, false), x0 = Math.trunc((32 - w) / 2);
+    crkDrawText(fb, label, x0, 1, false);
+    const beat = Math.floor(s / 90);
+    for (let x = 0; x < 32; x += 2) {
+      if (x >= x0 - 2 && x <= x0 + w + 1) continue;
+      const h = 1 + ((x * 37 + beat * 53 + x * x * 11 + beat * beat * 7) % 7);
+      for (let y = 8 - h; y < 8; y++) fbSet(x, y);
+    }
+    if (hundred && ((s >= 600 && s < 750) || (s >= 1000 && s < 1150))) crkInvert();
+  } else return crkAnimScroll(t - 2900, crkAnimText);
+  return false;
+}
+
+function crkAnimWin(t) {
+  if (t < 2200) {
+    for (let x = 0; x < 32; x++) {
+      const y = round(3 + 3 * Math.sin(x * 0.45 - t * 0.009));
+      fbSet(x, y); fbSet(x, y + 1);
+    }
+    return false;
+  }
+  return crkAnimScroll(t - 2200, crkAnimText);
+}
+
+function crkRunAnim(now) {
+  const t = now - crkAnimStartMs;
+  switch (crkAnim) {
+    case ANIM_FOUR: return crkAnimFour(t);
+    case ANIM_SIX: return crkAnimSix(t);
+    case ANIM_WICKET: return crkAnimWicket(t);
+    case ANIM_FIFTY: return crkAnimMilestone(t, false);
+    case ANIM_HUNDRED: return crkAnimMilestone(t, true);
+    case ANIM_WIN: return crkAnimWin(t);
+    default: return true;
+  }
+}
+
+function crkBeginPage(now, slide) {
+  crkShown = crkPages[crkPage] || '';
+  crkPageStartMs = now;
+  crkTight = false;
+  crkPageW = crkTextWidth(crkShown, false);
+  if (crkPageW > 32) {
+    const tightW = crkTextWidth(crkShown, true);
+    if (tightW <= 32) { crkTight = true; crkPageW = tightW; }
+  }
+  crkMarquee = crkPageW > 32;
+  crkSliding = slide && !crkMarquee;
+  if (crkSliding) { crkOldText.set(crkText); crkSlideStartMs = now; }
+}
+
+function crkRenderPage(now) {
+  if (crkPages.length === 0) return;
+  if (crkPage >= crkPages.length) { crkPage = 0; crkBeginPage(now, true); }
+  else if (crkPages[crkPage] !== crkShown) crkBeginPage(now, true);
+
+  const dots = crkBalls >= 0, textY = dots ? 0 : 1, elapsed = now - crkPageStartMs;
+  let done;
+  crkText.fill(0);
+  if (crkMarquee) {
+    const x = 32 - Math.floor(elapsed / CRK_SCROLL_MS);
+    crkDrawText(crkText, crkShown, x, textY, false);
+    done = x + crkPageW < 0;
+  } else {
+    crkDrawText(crkText, crkShown, Math.trunc((32 - crkPageW) / 2), textY, crkTight);
+    done = elapsed >= (crkPage === 0 ? CRK_MAIN_PAGE_MS : CRK_PAGE_MS);
+  }
+
+  if (crkSliding && now - crkSlideStartMs >= CRK_SLIDE_MS) crkSliding = false;
+  const mask = dots ? 0x3F : 0x7F;
+  if (crkSliding) {
+    const k = Math.floor((now - crkSlideStartMs) * 7 / CRK_SLIDE_MS);
+    for (let x = 0; x < 32; x++) fb[x] = ((crkOldText[x] >> k) | (crkText[x] << (7 - k))) & mask;
+  } else {
+    for (let x = 0; x < 32; x++) fb[x] = crkText[x] & mask;
+  }
+
+  if (dots) {
+    if (crkWiping && now - crkWipeMs >= 700) crkWiping = false;
+    if (crkNewBall && now - crkNewBallMs >= 1500) crkNewBall = false;
+    for (let i = 0; i < 6; i++) {
+      let lit = i < crkBalls;
+      if (crkWiping) lit = i >= Math.floor((now - crkWipeMs) / 100);
+      else if (lit && crkNewBall && i === crkBalls - 1) lit = (Math.floor((now - crkNewBallMs) / 150) & 1) === 0;
+      if (lit) for (let x = 2 + 5 * i; x < 6 + 5 * i; x++) fbSet(x, 7);
+    }
+  }
+
+  if (done) {
+    const next = (crkPage + 1) % crkPages.length;
+    if (next === crkPage && !crkMarquee) crkPageStartMs = now;
+    else { crkPage = next; crkBeginPage(now, true); }
+  }
+}
+
+function cricketTick(now) {
+  fb.fill(0);
+  if (crkAnim !== ANIM_NONE && crkRunAnim(now)) {
+    crkAnim = ANIM_NONE;
+    fb.fill(0); crkText.fill(0);
+    crkPage = 0;
+    crkBeginPage(now, false);
+  }
+  if (crkAnim === ANIM_NONE && crkQueue.length > 0) {
+    const ev = crkQueue.shift();
+    crkAnim = ev.anim; crkAnimStartMs = now; crkPartsLive = false; crkAnimText = ev.text;
+    fb.fill(0);
+    crkRunAnim(now);
+  }
+  if (crkAnim === ANIM_NONE) crkRenderPage(now);
+}
+
+function cricketSet(payload, now) {
+  const bar = payload.indexOf('|');
+  if (bar < 0) return false;
+  const b = payload.slice(0, bar).trim();
+  const balls = /^\d/.test(b) ? Math.min(6, Math.max(0, parseInt(b, 10))) : -1;
+  const pages = payload.slice(bar + 1).split('|').map((p) => p.trim().toUpperCase().slice(0, CRK_PAGE_LEN))
+    .filter((p) => p).slice(0, CRK_PAGES_MAX);
+  if (pages.length === 0) return false;
+  if (crkActive && crkBalls > 0 && balls === 0) { crkWiping = true; crkWipeMs = now; }
+  else if (crkActive && crkBalls >= 0 && balls > crkBalls) { crkNewBall = true; crkNewBallMs = now; }
+  crkPages = pages; crkBalls = balls;
+  if (!crkActive) { crkActive = true; crkPage = 0; crkText.fill(0); crkBeginPage(now, false); }
+  return true;
+}
+
+function cricketEvent(code, text) {
+  const map = { '4': ANIM_FOUR, '6': ANIM_SIX, 'W': ANIM_WICKET, '50': ANIM_FIFTY, '100': ANIM_HUNDRED, 'WIN': ANIM_WIN };
+  const a = map[String(code).toUpperCase()];
+  if (!a || crkQueue.length >= CRK_QUEUE_MAX) return false;
+  crkQueue.push({ anim: a, text: (text || '').toUpperCase().slice(0, CRK_PAGE_LEN) });
+  return true;
+}
+// ENGINE-END
+
+// ── Page: clock, canvas and controls ──────────────────────────────────────────
+const canvas = document.getElementById('led');
+const ctx = canvas.getContext('2d');
+let simNow = 1000, lastReal = performance.now(), lastTick = 0;
+
+function draw() {
+  const cell = canvas.width / 32;
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  for (let x = 0; x < 32; x++) {
+    for (let y = 0; y < 8; y++) {
+      const on = (fb[x] >> y) & 1;
+      ctx.beginPath();
+      ctx.arc((x + 0.5) * cell, (y + 0.5) * cell, cell * 0.36, 0, Math.PI * 2);
+      ctx.fillStyle = on ? '#ff2a1a' : '#1c0806';
+      if (on) { ctx.shadowColor = '#ff3b2a'; ctx.shadowBlur = cell * 0.5; } else { ctx.shadowBlur = 0; }
+      ctx.fill();
+    }
+  }
+  ctx.shadowBlur = 0;
+  // faint lines between the four 8x8 modules
+  ctx.strokeStyle = '#17171b';
+  for (let m = 1; m < 4; m++) { ctx.beginPath(); ctx.moveTo(m * 8 * cell, 0); ctx.lineTo(m * 8 * cell, canvas.height); ctx.stroke(); }
+}
+
+const NAMES = ['score pages', 'FOUR', 'SIX', 'WICKET', 'FIFTY', 'HUNDRED', 'WIN'];
+function frame(real) {
+  const speed = parseFloat(document.getElementById('speed').value);
+  const paused = document.getElementById('pause').checked;
+  if (!paused) simNow += (real - lastReal) * speed;
+  lastReal = real;
+  if (simNow - lastTick >= 33) {              // the firmware draws about 30 frames a second
+    lastTick = simNow;
+    cricketTick(simNow);
+    draw();
+    document.getElementById('state').textContent = crkAnim === ANIM_NONE
+      ? `page ${crkPage + 1}/${crkPages.length}: ${crkShown}${crkMarquee ? '  (scrolling)' : ''}`
+      : `animation: ${NAMES[crkAnim]}`;
+  }
+  requestAnimationFrame(frame);
+}
+
+document.querySelectorAll('button[data-e]').forEach((btn) =>
+  btn.addEventListener('click', () => cricketEvent(btn.dataset.e, btn.dataset.t || '')));
+
+document.getElementById('send').addEventListener('click', () => {
+  if (!cricketSet(document.getElementById('payload').value, simNow)) alert('Expected <balls>|PAGE|PAGE...');
+});
+
+// "Next ball": bump the over count in the payload box, to see the over row blink and sweep
+document.getElementById('ball').addEventListener('click', () => {
+  const box = document.getElementById('payload');
+  const bar = box.value.indexOf('|');
+  const balls = parseInt(box.value.slice(0, bar), 10);
+  if (bar < 0 || isNaN(balls)) return;
+  let next = balls + 1, rest = box.value.slice(bar);
+  if (next >= 6) next = 0;
+  rest = rest.replace(/OV (\d+)\.(\d)/i, (m, o, b) => next === 0 ? `OV ${+o + 1}.0` : `OV ${o}.${next}`);
+  box.value = next + rest;
+  cricketSet(box.value, simNow);
+});
+
+// The same made-up finish as "cricket_score.py --demo"
+const DEMO = [
+  [null, '2|IND 187/4|OV 18.2|NEED 24|10 BALLS|KOHLI 46*|PANDYA 31*', 14],
+  [['4', ''], '3|IND 191/4|OV 18.3|NEED 20|9 BALLS|KOHLI 50*|PANDYA 31*', 5],
+  [['50', 'KOHLI 50*'], '3|IND 191/4|OV 18.3|NEED 20|9 BALLS|KOHLI 50*|PANDYA 31*', 12],
+  [['6', ''], '4|IND 197/4|OV 18.4|NEED 14|8 BALLS|KOHLI 56*|PANDYA 31*', 10],
+  [['W', ''], '5|IND 197/5|OV 18.5|NEED 14|7 BALLS|KOHLI 56*|JADEJA 0*', 10],
+  [null, '0|IND 199/5|OV 19.0|NEED 12|6 BALLS|KOHLI 57*|JADEJA 1*', 8],
+  [['6', ''], '1|IND 205/5|OV 19.1|NEED 6|5 BALLS|KOHLI 63*|JADEJA 1*', 8],
+  [['6', ''], '2|IND 211/5|OV 19.2|KOHLI 69*|JADEJA 1*', 6],
+  [['WIN', 'IND WON BY 5 WICKETS'], '-|IND V AUS|IND WON BY 5 WICKETS', 20],
+];
+let demoTimer = null;
+document.getElementById('demo').addEventListener('click', () => {
+  clearTimeout(demoTimer);
+  let i = 0;
+  const step = () => {
+    if (i >= DEMO.length) return;
+    const [ev, payload, hold] = DEMO[i++];
+    document.getElementById('payload').value = payload;
+    cricketSet(payload, simNow);
+    if (ev) cricketEvent(ev[0], ev[1]);
+    demoTimer = setTimeout(step, hold * 1000 / parseFloat(document.getElementById('speed').value));
+  };
+  step();
+});
+
+cricketSet(document.getElementById('payload').value, simNow);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

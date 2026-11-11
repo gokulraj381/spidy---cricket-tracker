@@ -3,6 +3,7 @@
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <ESPAsyncWebServer.h>
+#include <ArduinoJson.h>
 #include <MD_MAX72xx.h>
 #include <MD_Parola.h>
 #include <SPI.h>
@@ -57,7 +58,7 @@ DNSServer      dnsServer;   // answers every hostname with our IP (captive porta
 // ─────────────────────────────────────────────────────────────────────────────
 //  Display state. Owned by loop(); the web task only reads it for /status.
 // ─────────────────────────────────────────────────────────────────────────────
-enum DisplayMode : uint8_t { MODE_TEXT, MODE_TIMER, MODE_DONE, MODE_SELFTEST, MODE_EYES, MODE_ALERT };
+enum DisplayMode : uint8_t { MODE_TEXT, MODE_TIMER, MODE_DONE, MODE_SELFTEST, MODE_EYES, MODE_ALERT, MODE_CRICKET };
 
 volatile DisplayMode mode = MODE_TEXT;
 char displayText[TEXT_MAX_LEN + 1] = "WELCOME!";
@@ -158,12 +159,103 @@ bool          alertFlashOn = false;
 bool          alertQueued  = false;  // arrived during a timer; shown when the timer ends
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  Cricket scoreboard. tools/cricket_score.py on the PC fetches the live score
+//  and sends it as short "pages" of text. The board rotates through the pages
+//  and plays an animation for a four, a six, a wicket, a fifty, a hundred and
+//  the result. Drawn in the same 32x8 logical frame as the eyes (strip lying
+//  flat, connector on the right), with the eyes' frame buffer.
+// ─────────────────────────────────────────────────────────────────────────────
+#define CRK_FRAME_MS     33         // about 30 fps
+#define CRK_PAGE_MS      3500UL     // how long a page that fits the strip stays up
+#define CRK_MAIN_PAGE_MS 6000UL     // the first page (the score) stays longer
+#define CRK_SCROLL_MS    45UL       // ms per pixel for pages wider than the strip
+#define CRK_SLIDE_MS     260UL      // page-change slide
+#define CRK_STALE_MS     180000UL   // no update for this long: the PC script is gone, back to idle
+#define CRK_PAGES_MAX    8
+#define CRK_PAGE_LEN     39
+#define CRK_LINE_MAX     239        // longest "q ..." payload
+#define CRK_QUEUE_MAX    4
+#define CRK_PARTS        20         // flying stump pixels
+
+enum CrkAnim : uint8_t { ANIM_NONE, ANIM_FOUR, ANIM_SIX, ANIM_WICKET, ANIM_FIFTY, ANIM_HUNDRED, ANIM_WIN };
+struct CrkEvent { CrkAnim anim; char text[CRK_PAGE_LEN + 1]; };
+struct CrkPart  { float x, y, vx, vy; };
+
+char          crkPages[CRK_PAGES_MAX][CRK_PAGE_LEN + 1];
+uint8_t       crkPageCount    = 0;
+int8_t        crkBalls        = -1;      // balls bowled in the current over, -1 = no over dots
+bool          crkActive       = false;   // fresh score data is available
+unsigned long crkLastUpdateMs = 0;
+unsigned long lastCrkFrameMs  = 0;
+
+uint8_t       crkPage         = 0;       // page on the display
+char          crkShown[CRK_PAGE_LEN + 1] = "";
+unsigned long crkPageStartMs  = 0;
+int           crkPageW        = 0;
+bool          crkTight        = false;   // narrow word gaps so the page just fits
+bool          crkMarquee      = false;   // page is wider than the strip and scrolls
+uint8_t       crkText[32];               // text layer of the current frame
+uint8_t       crkOldText[32];            // text layer sliding out
+bool          crkSliding      = false;
+unsigned long crkSlideStartMs = 0;
+bool          crkWiping       = false;   // end of over: the dots sweep away
+unsigned long crkWipeMs       = 0;
+bool          crkNewBall      = false;   // newest over dot blinks
+unsigned long crkNewBallMs    = 0;
+
+CrkAnim       crkAnim         = ANIM_NONE;
+unsigned long crkAnimStartMs  = 0;
+char          crkAnimText[CRK_PAGE_LEN + 1] = "";
+CrkEvent      crkQueue[CRK_QUEUE_MAX];
+uint8_t       crkQueueLen     = 0;
+CrkPart       crkParts[CRK_PARTS];
+bool          crkPartsLive    = false;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Live scores over Wi-Fi, without a PC. Besides running its own access point
+//  the board can join a home network. A background task then looks for a live
+//  international match on ESPN's public scoreboard (plain HTTP, no key) and
+//  feeds the scoreboard above. It only sees the totals, so a four or a six is
+//  inferred from the jump in the score, and there are no batter pages. The PC
+//  script (tools/cricket_score.py) has both and wins while it is running.
+// ─────────────────────────────────────────────────────────────────────────────
+#define NET_POLL_MS    10000UL      // score check while a match is followed
+#define NET_FIND_MS    60000UL      // search for a match while none is live
+#define NET_RESULT_MS  600000UL     // keep the result up this long
+#define NET_HOLD_MS    60000UL      // stay quiet this long after a score from the PC or the page
+#define NET_TIMEOUT_MS 12000UL      // one HTTP request
+#define NET_HOST_FIND  "site.web.api.espn.com"
+#define NET_PATH_FIND  "/apis/v2/scoreboard/header?sport=cricket&lang=en&region=in"
+#define NET_HOST_MATCH "site.api.espn.com"
+
+char          wifiSsid[33]  = "";   // home network to join, empty = access point only (saved in flash)
+char          wifiPass[65]  = "";
+bool          crkAuto       = true; // fetch live scores when Wi-Fi is set (saved in flash)
+char          crkTeam[12]   = "";   // only follow this team, e.g. "IND"; empty = any international
+
+// Hand-over from the network task to loop()
+portMUX_TYPE  netMux        = portMUX_INITIALIZER_UNLOCKED;
+volatile bool netKick       = false;   // settings changed: wake the task
+volatile bool netReset      = false;   // settings changed: drop the match being followed
+bool          netHasScore   = false;
+bool          netWantStop   = false;
+char          netPayload[CRK_LINE_MAX + 1] = "";
+char          netEvents[3][CRK_PAGE_LEN + 8];
+uint8_t       netEventCount = 0;
+char          netStatus[48] = "Starting";
+
+bool          crkFromNet      = false;   // the score on the display came from the network task
+bool          crkExternalSeen = false;   // a score came from the PC or the page
+unsigned long crkExternalMs   = 0;
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  Commands from the web server. Handlers run on the AsyncTCP task, not in
 //  loop(), so they never touch the display. They queue one command here and
 //  loop() applies it on its next pass.
 // ─────────────────────────────────────────────────────────────────────────────
 enum Command : uint8_t { CMD_NONE, CMD_SET_TEXT, CMD_START_TIMER, CMD_CANCEL_TIMER, CMD_SELFTEST, CMD_SET_MODULE,
-                         CMD_SHOW_EYES, CMD_SHOW_TEXT, CMD_ALERT, CMD_CLEAR_ALERT };
+                         CMD_SHOW_EYES, CMD_SHOW_TEXT, CMD_ALERT, CMD_CLEAR_ALERT,
+                         CMD_CRICKET, CMD_CRICKET_EVENT, CMD_CRICKET_STOP, CMD_SET_WIFI, CMD_SET_AUTO };
 
 portMUX_TYPE  cmdMux         = portMUX_INITIALIZER_UNLOCKED;
 Command       pendingCmd     = CMD_NONE;
@@ -173,6 +265,9 @@ unsigned long pendingTimerMs = 0;
 bool          pendingFlip    = false;
 uint8_t       pendingModule  = MODULE_TYPE_DEFAULT;
 unsigned long pendingAlertMs = 0;
+char          pendingCricket[CRK_LINE_MAX + 1] = "";
+char          pendingPass[sizeof(wifiPass)] = "";
+bool          pendingKeepPass = false;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Web page (kept in flash, served without copying to RAM)
@@ -695,6 +790,64 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
       </div>
 
       <div class="container">
+        <h1>Cricket Score</h1>
+        <p class="hint">
+          Run tools/cricket_score.py on your PC during an international match. The matrix shows
+          the live score and plays an animation for every four, six and wicket. Lay the strip
+          flat with the connector on the right. The buttons below preview it without a match.
+        </p>
+        <div class="timer-state" id="cricketState" style="text-align: center; margin-bottom: 1.5rem;">Not running</div>
+        <div class="btn-row" style="margin-bottom: 0.75rem;">
+          <button type="button" class="submit-btn" id="crkDemoBtn">Demo Score</button>
+          <button type="button" class="submit-btn secondary" id="crkStopBtn" disabled>Stop</button>
+        </div>
+        <div class="btn-row" style="margin-bottom: 0.75rem;">
+          <button type="button" class="submit-btn secondary crk-ev" data-e="4">Four</button>
+          <button type="button" class="submit-btn secondary crk-ev" data-e="6">Six</button>
+          <button type="button" class="submit-btn secondary crk-ev" data-e="W">Wicket</button>
+        </div>
+        <div class="btn-row">
+          <button type="button" class="submit-btn secondary crk-ev" data-e="50" data-t="KOHLI 50*">Fifty</button>
+          <button type="button" class="submit-btn secondary crk-ev" data-e="100" data-t="KOHLI 100*">Hundred</button>
+          <button type="button" class="submit-btn secondary crk-ev" data-e="WIN" data-t="INDIA WON BY 5 WICKETS">Win</button>
+        </div>
+        <div class="status" id="cricketStatus"></div>
+      </div>
+
+      <div class="container">
+        <h1>Live Scores over Wi-Fi</h1>
+        <p class="hint">
+          Let the board join your home Wi-Fi and fetch international scores by itself, with no PC.
+          This page travels over an open network, so enter the password only at home.
+        </p>
+        <div class="form-group">
+          <label for="wifiSsid">Home Wi-Fi name (2.4 GHz)</label>
+          <input type="text" id="wifiSsid" maxlength="32" placeholder="Network name" autocomplete="off">
+        </div>
+        <div class="form-group">
+          <label for="wifiPass">Password</label>
+          <input type="text" id="wifiPass" maxlength="64" placeholder="Empty keeps the saved password" autocomplete="off">
+        </div>
+        <div class="btn-row" style="margin-bottom: 1.5rem;">
+          <button type="button" class="submit-btn" id="wifiSaveBtn">Save Wi-Fi</button>
+          <button type="button" class="submit-btn secondary" id="wifiForgetBtn">Forget</button>
+        </div>
+        <div class="form-group">
+          <label for="crkTeam">Only this team (optional)</label>
+          <input type="text" id="crkTeam" maxlength="11" placeholder="IND, AUS, ENG... empty = any international" autocomplete="off">
+        </div>
+        <label class="check">
+          <input type="checkbox" id="crkAuto">
+          Show live international scores automatically
+        </label>
+        <div class="btn-row">
+          <button type="button" class="submit-btn" id="autoSaveBtn">Save</button>
+        </div>
+        <div class="timer-state" id="netState" style="margin-top: 1rem; text-align: center;"></div>
+        <div class="status" id="netStatus"></div>
+      </div>
+
+      <div class="container">
         <h1>Countdown Timer</h1>
         <p class="hint">
           Stand the matrix upright with the connector at the bottom. The bar fills from the bottom
@@ -819,7 +972,13 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
 
     function render(st) {
       currentMode = st.mode;
-      cancelBtn.disabled = (st.mode === 'text' || st.mode === 'eyes');
+      cancelBtn.disabled = (st.mode === 'text' || st.mode === 'eyes' || st.mode === 'cricket');
+      $('cricketState').textContent = !st.cricket ? 'Not running'
+        : (st.mode === 'cricket' ? 'Showing: ' : 'Ready, shows when the display is free: ') + st.cricket;
+      $('crkStopBtn').disabled = !st.cricket;
+      autoOn = !!st.auto;
+      $('netState').textContent = (st.wifi ? 'Wi-Fi "' + st.wifi + '": ' + st.wifiState : 'No home Wi-Fi set')
+        + (st.wifi ? ' - ' + st.net : '');
       $('eyesState').textContent = (st.mode === 'eyes') ? 'Eyes are showing now'
         : 'Resting screen: ' + (st.idle === 'eyes' ? 'eyes' : 'scrolling text');
       $('alertState').textContent = (st.mode === 'alert') ? 'Showing: ' + st.alert
@@ -858,6 +1017,9 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
           $('speed').value = st.speed;
           $('flip').checked = st.flip;
           moduleSel.value  = String(st.module);
+          $('wifiSsid').value = st.wifi;
+          $('crkTeam').value  = st.team;
+          $('crkAuto').checked = !!st.auto;
         }
         render(st);
       } catch (err) {
@@ -981,6 +1143,61 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
 
     dismissBtn.addEventListener('click', () =>
       simpleCall('/clearAlert', $('alertStatus'), 'Alert dismissed', 'Failed to dismiss'));
+
+    // ── Cricket ────────────────────────────────────────────────────────────
+    const CRK_DEMO = '/cricket?d=' + encodeURIComponent('2|IND 187/4|OV 18.2|NEED 24|10 BALLS|KOHLI 72*|PANDYA 31*');
+
+    $('crkDemoBtn').addEventListener('click', () =>
+      simpleCall(CRK_DEMO, $('cricketStatus'), 'Demo score on the matrix for 3 minutes', 'Failed to show the score'));
+
+    let autoOn = false;
+    const autoUrl = (on) => '/cricketAuto?on=' + (on ? 1 : 0) + '&team=' + encodeURIComponent($('crkTeam').value.trim());
+
+    $('crkStopBtn').addEventListener('click', async () => {
+      if (autoOn) {
+        // Otherwise the board would bring the live score straight back
+        try { await fetch(autoUrl(false)); $('crkAuto').checked = false; } catch (err) { console.error(err); }
+        await new Promise((r) => setTimeout(r, 300));
+      }
+      simpleCall('/cricketStop', $('cricketStatus'), 'Scoreboard stopped', 'Failed to stop');
+    });
+
+    // ── Live scores over Wi-Fi ─────────────────────────────────────────────
+    const refreshSoon = () => [2000, 8000, 15000].forEach((ms) => setTimeout(() => refresh(false), ms));
+
+    $('wifiSaveBtn').addEventListener('click', () => {
+      const ssid = $('wifiSsid').value.trim();
+      const pass = $('wifiPass').value;
+      if (!ssid) { showStatus($('netStatus'), 'Enter the Wi-Fi name', 'error'); return; }
+      if (pass && pass.length < 8) { showStatus($('netStatus'), 'A Wi-Fi password has at least 8 characters', 'error'); return; }
+      simpleCall('/wifi?ssid=' + encodeURIComponent(ssid) + (pass ? '&pass=' + encodeURIComponent(pass) : ''),
+                 $('netStatus'), 'Saved. Joining the network...', 'Failed to save the Wi-Fi settings');
+      $('wifiPass').value = '';
+      refreshSoon();
+    });
+
+    $('wifiForgetBtn').addEventListener('click', () => {
+      $('wifiSsid').value = '';
+      simpleCall('/wifi?ssid=', $('netStatus'), 'Home Wi-Fi forgotten', 'Failed to forget the Wi-Fi settings');
+    });
+
+    $('autoSaveBtn').addEventListener('click', () => {
+      simpleCall(autoUrl($('crkAuto').checked), $('netStatus'), 'Saved', 'Failed to save');
+      refreshSoon();
+    });
+
+    document.querySelectorAll('.crk-ev').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        if (currentMode !== 'cricket') {
+          // Animations only play on the scoreboard, so bring up the demo score first
+          try { await fetch(CRK_DEMO); } catch (err) { console.error(err); }
+          await new Promise((r) => setTimeout(r, 300));
+        }
+        const text = btn.dataset.t ? '&text=' + encodeURIComponent(btn.dataset.t) : '';
+        simpleCall('/cricketEvent?e=' + btn.dataset.e + text, $('cricketStatus'),
+                   btn.textContent + ' animation playing', 'Failed to play the animation');
+      });
+    });
 
     // ── Display setup ──────────────────────────────────────────────────────
     moduleSel.addEventListener('change', async () => {
@@ -1150,6 +1367,7 @@ static void applyModuleType(uint8_t idx, bool save) {
     case MODE_SELFTEST: selfTestDraw(selfStep); break;
     case MODE_EYES:     P.displayClear(); eyesDirty = true; break;
     case MODE_ALERT:    P.displayClear(); alertPhase = 0; alertStartMs = millis(); alertFlashOn = true; fillAll(true); break;
+    case MODE_CRICKET:  P.displayClear(); eyesDirty = true; break;
     default:            break;
   }
 }
@@ -1261,13 +1479,17 @@ static void requestAlert(const char *text, unsigned long durationMs) {
   strncpy(alertText, text, TEXT_MAX_LEN);
   alertText[TEXT_MAX_LEN] = '\0';
   alertMs = durationMs;
-  if (mode == MODE_TEXT || mode == MODE_EYES || mode == MODE_ALERT) startAlert();
+  if (mode == MODE_TEXT || mode == MODE_EYES || mode == MODE_ALERT || mode == MODE_CRICKET) startAlert();
   else alertQueued = true;
 }
 
-// Whatever the user chose as the resting screen: text or eyes. A queued alert wins.
+static void startCricket();
+
+// Whatever the user chose as the resting screen: text or eyes. A queued alert
+// wins, and so does the cricket scoreboard while the PC keeps sending a score.
 static void startIdle() {
   if (alertQueued)        startAlert();
+  else if (crkActive)     startCricket();
   else if (idleMode == 1) startEyes();
   else                    startTextMode();
 }
@@ -1300,6 +1522,948 @@ static void eyesDumpFrame() {
   Serial.printf("look=%d blinking=%d\n", (int)lookX, blinking ? 1 : 0);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Cricket scoreboard engine
+// ─────────────────────────────────────────────────────────────────────────────
+
+// 5-row font, 1 to 5 columns wide. Each row is `w` bits, leftmost pixel first.
+// Entry 0 is the space and stands in for any character that has no glyph.
+struct CrkGlyph { char c; uint8_t w; uint8_t rows[5]; };
+static const CrkGlyph CRK_FONT[] = {
+  {' ', 1, {0b0, 0b0, 0b0, 0b0, 0b0}},
+  {'0', 3, {0b111, 0b101, 0b101, 0b101, 0b111}},
+  {'1', 3, {0b010, 0b110, 0b010, 0b010, 0b111}},
+  {'2', 3, {0b111, 0b001, 0b111, 0b100, 0b111}},
+  {'3', 3, {0b111, 0b001, 0b111, 0b001, 0b111}},
+  {'4', 3, {0b101, 0b101, 0b111, 0b001, 0b001}},
+  {'5', 3, {0b111, 0b100, 0b111, 0b001, 0b111}},
+  {'6', 3, {0b111, 0b100, 0b111, 0b101, 0b111}},
+  {'7', 3, {0b111, 0b001, 0b001, 0b010, 0b010}},
+  {'8', 3, {0b111, 0b101, 0b111, 0b101, 0b111}},
+  {'9', 3, {0b111, 0b101, 0b111, 0b001, 0b111}},
+  {'A', 3, {0b010, 0b101, 0b111, 0b101, 0b101}},
+  {'B', 3, {0b110, 0b101, 0b110, 0b101, 0b110}},
+  {'C', 3, {0b011, 0b100, 0b100, 0b100, 0b011}},
+  {'D', 3, {0b110, 0b101, 0b101, 0b101, 0b110}},
+  {'E', 3, {0b111, 0b100, 0b110, 0b100, 0b111}},
+  {'F', 3, {0b111, 0b100, 0b110, 0b100, 0b100}},
+  {'G', 3, {0b011, 0b100, 0b101, 0b101, 0b011}},
+  {'H', 3, {0b101, 0b101, 0b111, 0b101, 0b101}},
+  {'I', 3, {0b111, 0b010, 0b010, 0b010, 0b111}},
+  {'J', 3, {0b001, 0b001, 0b001, 0b101, 0b010}},
+  {'K', 3, {0b101, 0b101, 0b110, 0b101, 0b101}},
+  {'L', 3, {0b100, 0b100, 0b100, 0b100, 0b111}},
+  {'M', 5, {0b10001, 0b11011, 0b10101, 0b10001, 0b10001}},
+  {'N', 3, {0b101, 0b111, 0b111, 0b111, 0b101}},
+  {'O', 3, {0b010, 0b101, 0b101, 0b101, 0b010}},
+  {'P', 3, {0b110, 0b101, 0b110, 0b100, 0b100}},
+  {'Q', 3, {0b010, 0b101, 0b101, 0b111, 0b011}},
+  {'R', 3, {0b110, 0b101, 0b110, 0b101, 0b101}},
+  {'S', 3, {0b011, 0b100, 0b010, 0b001, 0b110}},
+  {'T', 3, {0b111, 0b010, 0b010, 0b010, 0b010}},
+  {'U', 3, {0b101, 0b101, 0b101, 0b101, 0b111}},
+  {'V', 3, {0b101, 0b101, 0b101, 0b101, 0b010}},
+  {'W', 5, {0b10001, 0b10001, 0b10101, 0b10101, 0b01010}},
+  {'X', 3, {0b101, 0b101, 0b010, 0b101, 0b101}},
+  {'Y', 3, {0b101, 0b101, 0b010, 0b010, 0b010}},
+  {'Z', 3, {0b111, 0b001, 0b010, 0b100, 0b111}},
+  {'/', 3, {0b001, 0b001, 0b010, 0b100, 0b100}},
+  {'-', 3, {0b000, 0b000, 0b111, 0b000, 0b000}},
+  {'+', 3, {0b000, 0b010, 0b111, 0b010, 0b000}},
+  {'*', 3, {0b101, 0b010, 0b101, 0b000, 0b000}},
+  {'.', 1, {0b0, 0b0, 0b0, 0b0, 0b1}},
+  {'!', 1, {0b1, 0b1, 0b1, 0b0, 0b1}},
+  {':', 1, {0b0, 0b1, 0b0, 0b1, 0b0}},
+};
+
+static const CrkGlyph *crkGlyph(char c) {
+  if (c >= 'a' && c <= 'z') c -= 32;
+  for (const CrkGlyph &g : CRK_FONT) {
+    if (g.c == c) return &g;
+  }
+  return &CRK_FONT[0];
+}
+
+// Pixel width of a string. `tight` shrinks the gap between words from 3 to 2.
+static int crkTextWidth(const char *s, bool tight) {
+  int w = 0;
+  for (; *s; s++) {
+    const CrkGlyph *g = crkGlyph(*s);
+    w += ((g->c == ' ') ? (tight ? 0 : 1) : g->w) + 1;
+  }
+  return (w > 0) ? w - 1 : 0;
+}
+
+// Draw a string into a 32-column layer with its top-left corner at (x, y).
+static void crkDrawText(uint8_t *layer, const char *s, int x, int y, bool tight) {
+  for (; *s; s++) {
+    const CrkGlyph *g = crkGlyph(*s);
+    if (g->c == ' ') {
+      x += (tight ? 0 : 1) + 1;
+      continue;
+    }
+    for (int r = 0; r < 5; r++) {
+      for (int c = 0; c < g->w; c++) {
+        if (!((g->rows[r] >> (g->w - 1 - c)) & 1)) continue;
+        const int px = x + c, py = y + r;
+        if (px >= 0 && px < 32 && py >= 0 && py < 8) layer[px] |= (uint8_t)(1 << py);
+      }
+    }
+    x += g->w + 1;
+  }
+}
+
+static void crkCentered(const char *s, int y) {
+  crkDrawText(eyesFb, s, (32 - crkTextWidth(s, false)) / 2, y, false);
+}
+
+static void crkFill()   { memset(eyesFb, 0xFF, sizeof(eyesFb)); }
+static void crkInvert() { for (int x = 0; x < 32; x++) eyesFb[x] = (uint8_t)~eyesFb[x]; }
+
+static void crkBall(float x, float y) {
+  const int bx = (int)roundf(x), by = (int)roundf(y);
+  fbSet(bx, by); fbSet(bx + 1, by); fbSet(bx, by + 1); fbSet(bx + 1, by + 1);
+}
+
+// Scroll `text` through once, right to left. True when it has left the strip.
+static bool crkAnimScroll(unsigned long t, const char *text) {
+  if (!text[0]) return true;
+  const int x = 32 - (int)(t / CRK_SCROLL_MS);
+  crkDrawText(eyesFb, text, x, 1, false);
+  return x + crkTextWidth(text, false) < 0;
+}
+
+// FOUR: the ball races along the ground to the rope, a flash, then the word.
+static bool crkAnimFour(unsigned long t) {
+  if (t < 900) {
+    const float bx = -2.0f + 36.0f * (t / 900.0f);
+    for (int x = 0; x < 32; x++) {
+      if (((x + (int)(t / 30)) & 3) == 0) fbSet(x, 7);          // grass streaming past
+    }
+    crkBall(bx, 4);
+    for (int i = 1; i <= 4; i++) fbSet((int)bx - 2 * i, 5 - (i & 1));
+  } else if (t < 1020) {
+    crkFill();
+  } else if (t < 1100) {
+    // dark beat
+  } else if (t < 2900) {
+    const unsigned long s  = t - 1100;
+    const int           cx = (32 - crkTextWidth("FOUR!", false)) / 2;
+    const int           x  = (s < 220) ? 32 - (int)((32 - cx) * (s / 220.0f)) : cx;
+    crkDrawText(eyesFb, "FOUR!", x, 1, false);
+    if ((s >= 500 && s < 650) || (s >= 850 && s < 1000)) crkInvert();
+  } else {
+    return true;
+  }
+  return false;
+}
+
+// SIX: the ball sails up and out of the ground, fireworks, then the word.
+static bool crkAnimSix(unsigned long t) {
+  if (t < 1000) {
+    for (int i = 0; i < 4; i++) {
+      const float u = ((float)t - i * 55.0f) / 1000.0f;
+      if (u < 0.0f) continue;
+      const float x = 31.0f * u;
+      const float y = 6.0f - 7.5f * u * (2.0f - u);
+      if (i == 0) crkBall(x, y);
+      else        fbSet((int)roundf(x), (int)roundf(y) + 1);
+    }
+  } else if (t < 2300) {
+    static const int8_t CX[3] = {6, 17, 26};
+    static const int8_t CY[3] = {3, 4, 3};
+    for (int b = 0; b < 3; b++) {
+      const long age = (long)t - 1000 - b * 300;
+      if (age < 0 || age > 650) continue;
+      const float r = 0.6f + age / 110.0f;
+      if (age < 120) fbSet(CX[b], CY[b]);
+      for (int d = 0; d < 8; d++) {
+        if (age > 400 && (d & 1)) continue;                      // thins out as it fades
+        const float a = d * 0.7853982f;
+        fbSet((int)roundf(CX[b] + cosf(a) * r * 1.3f), (int)roundf(CY[b] + sinf(a) * r * 0.8f));
+        if (age > 150 && age < 400) {
+          fbSet((int)roundf(CX[b] + cosf(a) * r * 0.6f), (int)roundf(CY[b] + sinf(a) * r * 0.4f));
+        }
+      }
+    }
+  } else if (t < 3900) {
+    const unsigned long s  = t - 2300;
+    const int           w  = crkTextWidth("SIX!", false);
+    const int           x0 = (32 - w) / 2;
+    crkDrawText(eyesFb, "SIX!", x0, 1, false);
+    for (int i = 0; i < 5; i++) {                                // twinkles either side of the word
+      const int x = random(0, 32);
+      if (x >= x0 - 1 && x <= x0 + w) continue;
+      fbSet(x, random(0, 8));
+    }
+    if ((s >= 450 && s < 600) || (s >= 800 && s < 950)) crkInvert();
+  } else {
+    return true;
+  }
+  return false;
+}
+
+// WICKET: the ball hits the stumps, they fly apart, then OUT! flashes.
+static bool crkAnimWicket(unsigned long t) {
+  static const int8_t STUMP_X[3] = {24, 26, 28};
+  if (t < 700) {
+    for (int s = 0; s < 3; s++) {
+      for (int y = 2; y < 8; y++) fbSet(STUMP_X[s], y);
+    }
+    fbSet(25, 1); fbSet(27, 1);                                   // bails
+    const float bx = -2.0f + 24.0f * (t / 700.0f);
+    crkBall(bx, 4);
+    for (int i = 1; i <= 3; i++) fbSet((int)bx - 2 * i, 5 - (i & 1));
+  } else if (t < 1800) {
+    if (!crkPartsLive) {
+      crkPartsLive = true;
+      uint8_t n = 0;
+      for (int s = 0; s < 3; s++) {
+        for (int y = 2; y < 8; y++) {
+          crkParts[n++] = { (float)STUMP_X[s], (float)y, random(-90, 60) / 100.0f, -random(10, 110) / 100.0f };
+        }
+      }
+      crkParts[n++] = { 25.0f, 1.0f, -0.5f, -2.0f };
+      crkParts[n++] = { 27.0f, 1.0f,  0.7f, -2.2f };
+    }
+    if (t < 790) crkFill();                                       // impact flash
+    for (uint8_t i = 0; i < CRK_PARTS; i++) {
+      CrkPart &p = crkParts[i];
+      p.x += p.vx; p.y += p.vy; p.vy += 0.09f;
+      if (t >= 790) fbSet((int)roundf(p.x), (int)roundf(p.y));
+    }
+  } else if (t < 3700) {
+    crkCentered("OUT!", 1);
+    if (((t - 1800) / 240) & 1) crkInvert();
+  } else {
+    return true;
+  }
+  return false;
+}
+
+// FIFTY / HUNDRED: sparkles, the number between dancing bars, then the name.
+static bool crkAnimMilestone(unsigned long t, bool hundred) {
+  const char *label = hundred ? "100!" : "50!";
+  if (t < 900) {
+    const int n = 4 + (int)(t / 60);
+    for (int i = 0; i < n; i++) fbSet(random(0, 32), random(0, 8));
+  } else if (t < 2900) {
+    const unsigned long s  = t - 900;
+    const int           w  = crkTextWidth(label, false);
+    const int           x0 = (32 - w) / 2;
+    crkDrawText(eyesFb, label, x0, 1, false);
+    const unsigned long beat = s / 90;
+    for (int x = 0; x < 32; x += 2) {
+      if (x >= x0 - 2 && x <= x0 + w + 1) continue;
+      const int h = 1 + (int)((x * 37UL + beat * 53UL + (unsigned long)x * x * 11UL + beat * beat * 7UL) % 7UL);
+      for (int y = 8 - h; y < 8; y++) fbSet(x, y);
+    }
+    if (hundred && ((s >= 600 && s < 750) || (s >= 1000 && s < 1150))) crkInvert();
+  } else {
+    return crkAnimScroll(t - 2900, crkAnimText);
+  }
+  return false;
+}
+
+// WIN: a wave runs along the strip, then the result scrolls through.
+static bool crkAnimWin(unsigned long t) {
+  if (t < 2200) {
+    for (int x = 0; x < 32; x++) {
+      const int y = (int)roundf(3.0f + 3.0f * sinf(x * 0.45f - t * 0.009f));
+      fbSet(x, y); fbSet(x, y + 1);
+    }
+    return false;
+  }
+  return crkAnimScroll(t - 2200, crkAnimText);
+}
+
+static bool crkRunAnim(unsigned long now) {
+  const unsigned long t = now - crkAnimStartMs;
+  switch (crkAnim) {
+    case ANIM_FOUR:    return crkAnimFour(t);
+    case ANIM_SIX:     return crkAnimSix(t);
+    case ANIM_WICKET:  return crkAnimWicket(t);
+    case ANIM_FIFTY:   return crkAnimMilestone(t, false);
+    case ANIM_HUNDRED: return crkAnimMilestone(t, true);
+    case ANIM_WIN:     return crkAnimWin(t);
+    default:           return true;
+  }
+}
+
+// Put page `crkPage` on the display. With `slide` the old page slides up and
+// out while the new one comes in from below.
+static void crkBeginPage(unsigned long now, bool slide) {
+  strncpy(crkShown, crkPages[crkPage], CRK_PAGE_LEN);
+  crkShown[CRK_PAGE_LEN] = '\0';
+  crkPageStartMs = now;
+  crkTight       = false;
+  crkPageW       = crkTextWidth(crkShown, false);
+  if (crkPageW > 32) {
+    const int tightW = crkTextWidth(crkShown, true);
+    if (tightW <= 32) { crkTight = true; crkPageW = tightW; }
+  }
+  crkMarquee = (crkPageW > 32);
+  crkSliding = slide && !crkMarquee;
+  if (crkSliding) {
+    memcpy(crkOldText, crkText, sizeof(crkOldText));
+    crkSlideStartMs = now;
+  }
+}
+
+static void crkRenderPage(unsigned long now) {
+  if (crkPageCount == 0) return;
+  if (crkPage >= crkPageCount) {
+    crkPage = 0;
+    crkBeginPage(now, true);
+  } else if (strcmp(crkPages[crkPage], crkShown) != 0) {
+    crkBeginPage(now, true);                       // the score changed while this page was up
+  }
+
+  const bool          dots    = (crkBalls >= 0);
+  const int           textY   = dots ? 0 : 1;      // the over dots take the bottom row
+  const unsigned long elapsed = now - crkPageStartMs;
+  bool                done;
+
+  memset(crkText, 0, sizeof(crkText));
+  if (crkMarquee) {
+    const int x = 32 - (int)(elapsed / CRK_SCROLL_MS);
+    crkDrawText(crkText, crkShown, x, textY, false);
+    done = (x + crkPageW < 0);
+  } else {
+    crkDrawText(crkText, crkShown, (32 - crkPageW) / 2, textY, crkTight);
+    done = elapsed >= ((crkPage == 0) ? CRK_MAIN_PAGE_MS : CRK_PAGE_MS);
+  }
+
+  if (crkSliding && now - crkSlideStartMs >= CRK_SLIDE_MS) crkSliding = false;
+  const uint8_t mask = dots ? 0x3F : 0x7F;
+  if (crkSliding) {
+    const int k = (int)((now - crkSlideStartMs) * 7UL / CRK_SLIDE_MS);   // 0..6 rows moved
+    for (int x = 0; x < 32; x++) {
+      eyesFb[x] = (uint8_t)(((crkOldText[x] >> k) | (crkText[x] << (7 - k))) & mask);
+    }
+  } else {
+    for (int x = 0; x < 32; x++) eyesFb[x] = crkText[x] & mask;
+  }
+
+  // Over dots: six dashes on the bottom row, one per ball bowled this over
+  if (dots) {
+    if (crkWiping  && now - crkWipeMs    >= 700)  crkWiping  = false;
+    if (crkNewBall && now - crkNewBallMs >= 1500) crkNewBall = false;
+    for (int i = 0; i < 6; i++) {
+      bool lit = (i < crkBalls);
+      if (crkWiping) {
+        lit = (i >= (int)((now - crkWipeMs) / 100));              // the finished over sweeps away
+      } else if (lit && crkNewBall && i == crkBalls - 1) {
+        lit = (((now - crkNewBallMs) / 150) & 1) == 0;            // the latest ball blinks
+      }
+      if (lit) {
+        for (int x = 2 + 5 * i; x < 6 + 5 * i; x++) fbSet(x, 7);
+      }
+    }
+  }
+
+  if (done) {
+    const uint8_t next = (uint8_t)((crkPage + 1) % crkPageCount);
+    if (next == crkPage && !crkMarquee) {
+      crkPageStartMs = now;                        // a single page that fits just stays up
+    } else {
+      crkPage = next;
+      crkBeginPage(now, true);
+    }
+  }
+}
+
+static void cricketTick(unsigned long now) {
+  memset(eyesFb, 0, sizeof(eyesFb));
+
+  if (crkAnim != ANIM_NONE && crkRunAnim(now)) {
+    crkAnim = ANIM_NONE;                           // finished: back to the score page
+    memset(eyesFb, 0, sizeof(eyesFb));
+    memset(crkText, 0, sizeof(crkText));
+    crkPage = 0;
+    crkBeginPage(now, false);
+  }
+  if (crkAnim == ANIM_NONE && crkQueueLen > 0) {
+    crkAnim        = crkQueue[0].anim;
+    crkAnimStartMs = now;
+    crkPartsLive   = false;
+    memcpy(crkAnimText, crkQueue[0].text, sizeof(crkAnimText));
+    crkQueueLen--;
+    memmove(&crkQueue[0], &crkQueue[1], crkQueueLen * sizeof(CrkEvent));
+    memset(eyesFb, 0, sizeof(eyesFb));
+    crkRunAnim(now);
+  }
+  if (crkAnim == ANIM_NONE) crkRenderPage(now);
+
+  if (eyesDirty || memcmp(eyesFb, eyesLastFb, sizeof(eyesFb)) != 0) eyesPushFrame();
+}
+
+static void startCricket() {
+  mode = MODE_CRICKET;
+  P.displayClear();
+  eyesDirty      = true;
+  lastCrkFrameMs = 0;
+  crkAnim        = ANIM_NONE;
+  crkQueueLen    = 0;
+  crkPage        = 0;
+  memset(crkText, 0, sizeof(crkText));
+  crkBeginPage(millis(), false);
+  Serial.println("Mode: cricket");
+}
+
+static void stopCricket() {
+  crkActive    = false;
+  crkPageCount = 0;
+  crkQueueLen  = 0;
+  crkAnim      = ANIM_NONE;
+  if (mode == MODE_CRICKET) {
+    Serial.println("Cricket stopped");
+    mode = MODE_TEXT;      // so startIdle() picks the resting screen
+    startIdle();
+  }
+}
+
+// New score from the PC: "<balls>|PAGE|PAGE|...". <balls> is the number of balls
+// bowled in the current over (0..6), or "-" to hide the over dots. The first
+// page is the score itself. Returns false if the payload is malformed.
+static bool cricketSet(const char *payload, bool fromNet = false) {
+  char buf[CRK_LINE_MAX + 1];
+  strncpy(buf, payload, CRK_LINE_MAX);
+  buf[CRK_LINE_MAX] = '\0';
+
+  char *bar = strchr(buf, '|');
+  if (!bar) return false;
+  *bar = '\0';
+  const char *b = buf;
+  while (*b == ' ') b++;
+  const int balls = (*b >= '0' && *b <= '9') ? constrain(atoi(b), 0, 6) : -1;
+
+  char    pages[CRK_PAGES_MAX][CRK_PAGE_LEN + 1];
+  uint8_t count = 0;
+  memset(pages, 0, sizeof(pages));
+  char *p = bar + 1;
+  while (p && count < CRK_PAGES_MAX) {
+    char *next = strchr(p, '|');
+    if (next) *next++ = '\0';
+    while (*p == ' ') p++;
+    size_t n = strlen(p);
+    while (n && p[n - 1] == ' ') n--;
+    if (n > CRK_PAGE_LEN) n = CRK_PAGE_LEN;
+    if (n) {
+      for (size_t i = 0; i < n; i++) pages[count][i] = (char)toupper((unsigned char)p[i]);
+      count++;
+    }
+    p = next;
+  }
+  if (count == 0) return false;
+
+  const unsigned long now = millis();
+  if (crkActive && crkBalls > 0 && balls == 0) {
+    crkWiping = true;  crkWipeMs = now;
+  } else if (crkActive && crkBalls >= 0 && balls > crkBalls) {
+    crkNewBall = true; crkNewBallMs = now;
+  }
+  memcpy(crkPages, pages, sizeof(crkPages));
+  crkPageCount    = count;
+  crkBalls        = (int8_t)balls;
+  crkLastUpdateMs = now;
+  crkActive       = true;
+  crkFromNet      = fromNet;
+  if (!fromNet) {
+    crkExternalSeen = true;
+    crkExternalMs   = now;
+  }
+  if (mode == MODE_TEXT || mode == MODE_EYES) startCricket();
+  return true;
+}
+
+// Queue an animation: "<code> [text]" with code 4, 6, W, 50, 100 or WIN. The
+// text scrolls after a 50, a 100 and a WIN (a name or the result).
+static bool cricketEvent(const char *arg) {
+  while (*arg == ' ') arg++;
+  char   code[8];
+  size_t n = 0;
+  while (*arg && *arg != ' ' && n < sizeof(code) - 1) code[n++] = (char)toupper((unsigned char)*arg++);
+  code[n] = '\0';
+  while (*arg == ' ') arg++;
+
+  CrkAnim a = ANIM_NONE;
+  if      (!strcmp(code, "4"))   a = ANIM_FOUR;
+  else if (!strcmp(code, "6"))   a = ANIM_SIX;
+  else if (!strcmp(code, "W"))   a = ANIM_WICKET;
+  else if (!strcmp(code, "50"))  a = ANIM_FIFTY;
+  else if (!strcmp(code, "100")) a = ANIM_HUNDRED;
+  else if (!strcmp(code, "WIN")) a = ANIM_WIN;
+  if (a == ANIM_NONE) return false;
+
+  if (mode != MODE_CRICKET) {
+    Serial.println("Cricket event ignored: the scoreboard is not showing");
+    return true;
+  }
+  if (crkQueueLen >= CRK_QUEUE_MAX) {
+    Serial.println("Cricket event dropped: queue full");
+    return true;
+  }
+  CrkEvent &ev = crkQueue[crkQueueLen++];
+  ev.anim = a;
+  size_t i = 0;
+  for (; arg[i] && i < CRK_PAGE_LEN; i++) ev.text[i] = (char)toupper((unsigned char)arg[i]);
+  ev.text[i] = '\0';
+  Serial.printf("Cricket event: %s %s\n", code, ev.text);
+  return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Live scores over Wi-Fi: network task
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Join the saved home network next to our own access point, or drop back to
+// access point only. Called from setup() and loop().
+static void wifiStartStation() {
+  if (wifiSsid[0]) {
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(wifiSsid, wifiPass);
+    Serial.printf("WiFi: joining \"%s\"\n", wifiSsid);
+  } else {
+    WiFi.disconnect();
+    WiFi.mode(WIFI_AP);
+    Serial.println("WiFi: no home network set, access point only");
+  }
+  WiFi.setTxPower(WIFI_TX_POWER);
+}
+
+static void setWifi(const char *ssid, const char *pass) {
+  portENTER_CRITICAL(&netMux);
+  strlcpy(wifiSsid, ssid, sizeof(wifiSsid));
+  strlcpy(wifiPass, pass, sizeof(wifiPass));
+  portEXIT_CRITICAL(&netMux);
+  prefs.putString("ssid", wifiSsid);
+  prefs.putString("pass", wifiPass);
+  wifiStartStation();
+  netReset = true;
+  netKick  = true;
+}
+
+static void setCricketAuto(bool on, const char *team) {
+  portENTER_CRITICAL(&netMux);
+  crkAuto = on;
+  size_t i = 0;
+  for (; team[i] && i < sizeof(crkTeam) - 1; i++) crkTeam[i] = (char)toupper((unsigned char)team[i]);
+  crkTeam[i] = '\0';
+  portEXIT_CRITICAL(&netMux);
+  prefs.putBool("auto", crkAuto);
+  prefs.putString("team", crkTeam);
+  Serial.printf("Cricket: live scores over Wi-Fi %s, team \"%s\"\n", on ? "on" : "off", crkTeam);
+  netReset = true;
+  netKick  = true;
+}
+
+static void netSetStatus(const char *s) {
+  portENTER_CRITICAL(&netMux);
+  strlcpy(netStatus, s, sizeof(netStatus));
+  portEXIT_CRITICAL(&netMux);
+}
+
+// Sleep, but wake at once when the settings change.
+static void netWait(unsigned long ms) {
+  const unsigned long start = millis();
+  while (millis() - start < ms && !netKick) vTaskDelay(pdMS_TO_TICKS(200));
+  netKick = false;
+}
+
+static void netPublish(const String &payload, const String *events, uint8_t count) {
+  portENTER_CRITICAL(&netMux);
+  strlcpy(netPayload, payload.c_str(), sizeof(netPayload));
+  netEventCount = count;
+  for (uint8_t i = 0; i < count; i++) strlcpy(netEvents[i], events[i].c_str(), sizeof(netEvents[0]));
+  netHasScore = true;
+  netWantStop = false;
+  portEXIT_CRITICAL(&netMux);
+}
+
+static void netRequestStop() {
+  portENTER_CRITICAL(&netMux);
+  netHasScore = false;
+  netWantStop = true;
+  portEXIT_CRITICAL(&netMux);
+}
+
+// Socket reader with a deadline, so a stalled server cannot hang the task. Also
+// what ArduinoJson parses from, which keeps the reply out of RAM.
+struct NetReader {
+  WiFiClient   &client;
+  unsigned long deadline;
+
+  int read() {
+    while (!client.available()) {
+      if (!client.connected() || (long)(millis() - deadline) >= 0) return -1;
+      vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    return client.read();
+  }
+  size_t readBytes(char *buf, size_t len) {
+    size_t n = 0;
+    while (n < len) {
+      const int c = read();
+      if (c < 0) break;
+      buf[n++] = (char)c;
+    }
+    return n;
+  }
+};
+
+// GET http://host/path and parse the JSON reply, keeping only what `filter` names.
+static bool netGetJson(const char *host, const String &path, JsonDocument &doc, const JsonDocument &filter) {
+  WiFiClient client;
+  if (!client.connect(host, 80, 6000)) return false;
+  client.print(String("GET ") + path + " HTTP/1.0\r\nHost: " + host +
+               "\r\nUser-Agent: Mozilla/5.0\r\nAccept: application/json\r\nConnection: close\r\n\r\n");
+
+  NetReader reader{client, millis() + NET_TIMEOUT_MS};
+  char   statusLine[16];
+  size_t n = 0;
+  int    c;
+  while ((c = reader.read()) >= 0 && c != '\n') {
+    if (n < sizeof(statusLine) - 1) statusLine[n++] = (char)c;
+  }
+  statusLine[n] = '\0';
+  bool ok = (n >= 12 && strncmp(statusLine, "HTTP/1.", 7) == 0 && strncmp(statusLine + 9, "200", 3) == 0);
+
+  int lineLen = 0;                                  // skip the headers, up to the blank line
+  while (ok) {
+    c = reader.read();
+    if (c < 0) ok = false;
+    else if (c == '\n') { if (lineLen == 0) break; lineLen = 0; }
+    else if (c != '\r') lineLen++;
+  }
+  if (ok) {
+    const DeserializationError err = deserializeJson(doc, reader, DeserializationOption::Filter(filter),
+                                                     DeserializationOption::NestingLimit(16));
+    ok = !err;
+  }
+  client.stop();
+  return ok;
+}
+
+// "404/4 (102 ov)" -> "404/4", "144 & 178" -> "144 + 178"
+static String netCleanScore(const char *s) {
+  String out;
+  int depth = 0;
+  for (; *s; s++) {
+    if (*s == '(') depth++;
+    else if (*s == ')') { if (depth > 0) depth--; }
+    else if (depth == 0) out += (*s == '&') ? '+' : *s;
+  }
+  out.trim();
+  return out;
+}
+
+static bool netContainsNoCase(const char *hay, const char *needle) {
+  const size_t n = strlen(needle);
+  if (n == 0) return true;
+  for (; *hay; hay++) {
+    if (strncasecmp(hay, needle, n) == 0) return true;
+  }
+  return false;
+}
+
+// Find a live international match. 1 = found (ids filled in), 0 = none, -1 = could not ask.
+static int netFindMatch(const char *team, const char *skipEvent, char *league, char *event, size_t idLen) {
+  JsonDocument filter;
+  JsonObject   fe = filter["sports"][0]["leagues"][0]["events"][0].to<JsonObject>();
+  filter["sports"][0]["leagues"][0]["id"] = true;
+  fe["id"]     = true;
+  fe["status"] = true;
+  fe["class"]["internationalClassId"]    = true;
+  fe["competitors"][0]["abbreviation"]   = true;
+  fe["competitors"][0]["displayName"]    = true;
+
+  JsonDocument doc;
+  if (!netGetJson(NET_HOST_FIND, NET_PATH_FIND, doc, filter)) return -1;
+
+  // Men's Tests, ODIs and T20Is (classes 1 to 3) first, then the other international classes
+  JsonArray leagues = doc["sports"][0]["leagues"];
+  for (int pass = 0; pass < 2; pass++) {
+    for (JsonObject lg : leagues) {
+      JsonArray evs = lg["events"];
+      for (JsonObject ev : evs) {
+        if (strcmp(ev["status"] | "", "in") != 0) continue;
+        const char *cls = ev["class"]["internationalClassId"] | "0";
+        if (!cls[0] || !strcmp(cls, "0")) continue;
+        const bool mainClass = !strcmp(cls, "1") || !strcmp(cls, "2") || !strcmp(cls, "3");
+        if ((pass == 0) != mainClass) continue;
+        const char *id = ev["id"] | "";
+        if (!id[0] || !strcmp(id, skipEvent)) continue;
+        if (team[0]) {
+          bool hit = false;
+          JsonArray sides = ev["competitors"];
+          for (JsonObject c : sides) {
+            if (!strcasecmp(c["abbreviation"] | "", team) || netContainsNoCase(c["displayName"] | "", team)) hit = true;
+          }
+          if (!hit) continue;
+        }
+        strlcpy(league, lg["id"] | "", idLen);
+        strlcpy(event, id, idLen);
+        return league[0] ? 1 : 0;
+      }
+    }
+  }
+  return 0;
+}
+
+struct NetTrack {
+  char          league[12];
+  char          event[12];
+  char          prevKey[40];     // innings the previous score belongs to
+  int           prevRuns;
+  int           prevWkts;
+  bool          hasPrev;
+  bool          sawLive;
+  unsigned long resultSince;     // 0 until the match is over
+  uint8_t       misses;
+};
+
+// Fetch the followed match and publish its pages. 1 = live, 2 = finished,
+// 0 = the match is not listed, -1 = could not ask.
+static int netPollMatch(NetTrack &t) {
+  JsonDocument filter;
+  filter["events"][0]["id"] = true;
+  JsonObject fc = filter["events"][0]["competitions"][0].to<JsonObject>();
+  fc["class"]["eventType"]             = true;
+  fc["status"]["summary"]              = true;
+  fc["status"]["type"]["description"]  = true;
+  fc["status"]["type"]["state"]        = true;
+  JsonObject ft = fc["competitors"][0].to<JsonObject>();
+  ft["score"]                 = true;
+  ft["team"]["abbreviation"]  = true;
+  ft["team"]["displayName"]   = true;
+  JsonObject fl = ft["linescores"][0].to<JsonObject>();
+  fl["runs"] = true; fl["wickets"] = true; fl["overs"] = true;
+  fl["isBatting"] = true; fl["isCurrent"] = true; fl["period"] = true;
+
+  JsonDocument doc;
+  if (!netGetJson(NET_HOST_MATCH, String("/apis/site/v2/sports/cricket/") + t.league + "/scoreboard", doc, filter)) return -1;
+
+  JsonObject comp;
+  JsonArray evs = doc["events"];
+  for (JsonObject ev : evs) {
+    if (!strcmp(ev["id"] | "", t.event)) comp = ev["competitions"][0];
+  }
+  JsonArray teams = comp["competitors"];
+  if (comp.isNull() || teams.size() != 2) return 0;
+
+  const char *state = comp["status"]["type"]["state"] | "";
+  const char *desc  = comp["status"]["type"]["description"] | "";
+  String      summary = comp["status"]["summary"] | "";
+  for (JsonObject tm : teams) {                          // "Sri Lanka trail by 30 runs" -> "SL trail by 30 runs"
+    const char *full = tm["team"]["displayName"] | "";
+    const char *abbr = tm["team"]["abbreviation"] | "";
+    if (full[0] && abbr[0]) summary.replace(full, abbr);
+  }
+  summary = netCleanScore(summary.c_str());
+  const String versus = String(teams[0]["team"]["abbreviation"] | "?") + " V " + String(teams[1]["team"]["abbreviation"] | "?");
+  netSetStatus((String("Following ") + versus).c_str());
+
+  String  payload;
+  String  events[3];
+  uint8_t eventCount = 0;
+
+  if (!strcmp(state, "post")) {
+    if (!t.resultSince) {
+      t.resultSince = millis() | 1;
+      if (t.sawLive) events[eventCount++] = String("WIN ") + summary;
+      Serial.printf("Cricket: result - %s\n", summary.c_str());
+    }
+    payload = String("-|") + versus + "|" + summary;
+    for (JsonObject tm : teams) {
+      const char *score = tm["score"] | "";
+      if (score[0]) payload += String("|") + (tm["team"]["abbreviation"] | "?") + " " + netCleanScore(score);
+    }
+    netPublish(payload, events, eventCount);
+    return 2;
+  }
+
+  JsonObject bat, innings;
+  for (JsonObject tm : teams) {
+    JsonArray lines = tm["linescores"];
+    for (JsonObject ls : lines) {
+      if ((ls["isCurrent"] | 0) && (ls["isBatting"] | false)) { bat = tm; innings = ls; }
+    }
+  }
+  if (strcmp(state, "in") != 0 || bat.isNull()) {         // not started yet, or between innings with no batting side
+    payload = String("-|") + versus;
+    if (desc[0]) payload += String("|") + desc;
+    netPublish(payload, events, 0);
+    return 1;
+  }
+
+  const String batAbbr = bat["team"]["abbreviation"] | "?";
+  const int    runs    = innings["runs"] | 0;
+  const int    wkts    = innings["wickets"] | 0;
+  const int    period  = innings["period"] | 0;
+  const int    tenths  = (int)lroundf((innings["overs"] | 0.0f) * 10.0f);
+  const int    whole   = tenths / 10;
+  const int    part    = tenths % 10;                     // balls bowled in this over
+  const int    bowled  = whole * 6 + part;
+
+  // The score text carries what the numbers do not: "(18.3/20 ov, target 160)"
+  const char *score  = bat["score"] | "";
+  int         target = 0, limit = 0;
+  const char *tg = strstr(score, "target ");
+  if (tg) target = atoi(tg + 7);
+  const char *open = strrchr(score, '(');
+  if (open) {
+    const char *slash = strchr(open, '/');
+    const char *ov    = strstr(open, " ov");
+    if (slash && ov && slash < ov) limit = atoi(slash + 1);
+  }
+  if (!limit) {
+    const char *type = comp["class"]["eventType"] | "";
+    if (!strcmp(type, "T20")) limit = 20;
+    else if (!strcmp(type, "ODI")) limit = 50;
+  }
+  const bool chasing = target > runs;
+
+  char buf[40];
+  payload = String(part > 6 ? 6 : part) + "|" + batAbbr + " " + runs;
+  if (wkts < 10) payload += String("/") + wkts;
+  snprintf(buf, sizeof(buf), "|OV %d.%d", whole, part);
+  payload += buf;
+  if (chasing) {
+    payload += String("|NEED ") + (target - runs);
+    if (limit * 6 > bowled) payload += String("|") + (limit * 6 - bowled) + " BALLS";
+  } else if (limit && bowled) {
+    snprintf(buf, sizeof(buf), "|CRR %.2f", runs * 6.0f / bowled);
+    payload += buf;
+  }
+  for (JsonObject tm : teams) {
+    const char *other = tm["score"] | "";
+    if (tm != bat && other[0]) payload += String("|") + (tm["team"]["abbreviation"] | "?") + " " + netCleanScore(other);
+  }
+  if (desc[0] && strcasecmp(desc, "Live") != 0) payload += String("|") + desc;     // STUMPS, INNINGS BREAK...
+  if (summary.length() && !chasing) payload += String("|") + summary;
+
+  // No boundary counts in this feed: read a four or a six from the jump in the total
+  snprintf(buf, sizeof(buf), "%s/%s/%d", t.event, batAbbr.c_str(), period);
+  if (t.hasPrev && !strcmp(buf, t.prevKey)) {
+    const int gained = runs - t.prevRuns;
+    if (gained == 4 || gained == 5)      events[eventCount++] = "4";
+    else if (gained == 6 || gained == 7) events[eventCount++] = "6";
+    if (wkts > t.prevWkts)               events[eventCount++] = "W";
+  }
+  strlcpy(t.prevKey, buf, sizeof(t.prevKey));
+  t.prevRuns = runs;
+  t.prevWkts = wkts;
+  t.hasPrev  = true;
+  t.sawLive  = true;
+
+  netPublish(payload, events, eventCount);
+  return 1;
+}
+
+static void netTask(void *) {
+  NetTrack t;
+  char     skip[sizeof(t.event)] = "";      // finished match we have stopped showing
+  bool     wasOn = false;
+  memset(&t, 0, sizeof(t));
+
+  for (;;) {
+    char team[sizeof(crkTeam)];
+    bool on, haveWifi;
+    portENTER_CRITICAL(&netMux);
+    haveWifi = wifiSsid[0] != '\0';
+    on       = crkAuto && haveWifi;
+    memcpy(team, crkTeam, sizeof(team));
+    portEXIT_CRITICAL(&netMux);
+
+    if (netReset) {
+      netReset = false;
+      memset(&t, 0, sizeof(t));
+      skip[0] = '\0';
+    }
+    if (!on) {
+      if (wasOn) netRequestStop();
+      wasOn = false;
+      netSetStatus(haveWifi ? "Live scores are switched off" : "No home Wi-Fi set");
+      netWait(2000);
+      continue;
+    }
+    wasOn = true;
+    if (WiFi.status() != WL_CONNECTED) {
+      netSetStatus("Connecting to Wi-Fi");
+      netWait(2000);
+      continue;
+    }
+
+    if (!t.event[0]) {
+      const int found = netFindMatch(team, skip, t.league, t.event, sizeof(t.event));
+      if (found < 0) {
+        netSetStatus("Could not reach the score server");
+        netWait(15000);
+        continue;
+      }
+      if (found == 0) {
+        memset(&t, 0, sizeof(t));
+        netRequestStop();
+        netSetStatus("No live international match");
+        netWait(NET_FIND_MS);
+        continue;
+      }
+      Serial.printf("Cricket: following match %s (series %s)\n", t.event, t.league);
+    }
+
+    const int r = netPollMatch(t);
+    if (r < 0) {
+      netSetStatus("Could not reach the score server");
+    } else if (r == 0) {
+      if (++t.misses >= 3) {                 // the match dropped off the scoreboard
+        memset(&t, 0, sizeof(t));
+        netRequestStop();
+      }
+    } else {
+      t.misses = 0;
+      if (r == 2 && millis() - t.resultSince > NET_RESULT_MS) {
+        strlcpy(skip, t.event, sizeof(skip));
+        memset(&t, 0, sizeof(t));
+        netRequestStop();
+      }
+    }
+    netWait(NET_POLL_MS);
+  }
+}
+
+// Take what the network task found and put it on the scoreboard.
+static void applyNetResult() {
+  bool    has, stop;
+  uint8_t count = 0;
+  char    payload[sizeof(netPayload)];
+  char    events[3][sizeof(netEvents[0])];
+
+  portENTER_CRITICAL(&netMux);
+  has  = netHasScore;
+  stop = netWantStop;
+  if (has) {
+    memcpy(payload, netPayload, sizeof(payload));
+    memcpy(events, netEvents, sizeof(events));
+    count = netEventCount;
+  }
+  netHasScore   = false;
+  netWantStop   = false;
+  netEventCount = 0;
+  portEXIT_CRITICAL(&netMux);
+
+  if (stop) {
+    if (crkActive && crkFromNet) stopCricket();
+    return;
+  }
+  if (!has) return;
+  // The PC script or the page is feeding the board: theirs is the better score
+  if (crkExternalSeen && millis() - crkExternalMs < NET_HOLD_MS) return;
+  if (!cricketSet(payload, true)) return;
+  for (uint8_t i = 0; i < count; i++) cricketEvent(events[i]);
+}
+
 // Pull one queued command from the web task and apply it.
 static void applyPendingCommand() {
   Command       cmd;
@@ -1309,11 +2473,17 @@ static void applyPendingCommand() {
   bool          flip;
   uint8_t       module;
   unsigned long alertDur;
+  char          cricket[CRK_LINE_MAX + 1];
+  char          pass[sizeof(pendingPass)];
+  bool          keepPass;
 
   portENTER_CRITICAL(&cmdMux);
   cmd        = pendingCmd;
   pendingCmd = CMD_NONE;
   memcpy(text, pendingText, sizeof(text));
+  memcpy(cricket, pendingCricket, sizeof(cricket));
+  memcpy(pass, pendingPass, sizeof(pass));
+  keepPass = pendingKeepPass;
   speed    = pendingSpeed;
   ms       = pendingTimerMs;
   flip     = pendingFlip;
@@ -1364,6 +2534,28 @@ static void applyPendingCommand() {
       applyModuleType(module, true);
       break;
 
+    case CMD_CRICKET:
+      cricketSet(cricket);
+      break;
+
+    case CMD_CRICKET_EVENT:
+      cricketEvent(cricket);
+      break;
+
+    case CMD_CRICKET_STOP:
+      stopCricket();
+      break;
+
+    case CMD_SET_WIFI:
+      // No password sent for the network we already know: keep the saved one
+      if (keepPass && !strcmp(text, wifiSsid)) strlcpy(pass, wifiPass, sizeof(pass));
+      setWifi(text, pass);
+      break;
+
+    case CMD_SET_AUTO:
+      setCricketAuto(flip, text);
+      break;
+
     case CMD_NONE:
     default:
       break;
@@ -1376,9 +2568,12 @@ static void applyPendingCommand() {
 //   c               cancel timer / back to text
 //   x<text>         set the scrolling text, e.g. "x HELLO"
 //   s               print current state
+//   q<score>        cricket score, e.g. "q 2|IND 187/4|OV 18.2|NEED 24" (see cricketSet)
+//   v<event>        cricket animation: "v 4", "v 6", "v W", "v 50 KOHLI 50*", "v 100 ...", "v WIN ..."
+//   Q               stop the cricket scoreboard
 static void handleSerialConsole() {
-  static char    line[TEXT_MAX_LEN + 8];
-  static uint8_t len = 0;
+  static char     line[CRK_LINE_MAX + 8];
+  static uint16_t len = 0;
 
   while (Serial.available()) {
     const char c = (char)Serial.read();
@@ -1438,6 +2633,42 @@ static void handleSerialConsole() {
       case 'k':
         clearAlert();
         break;
+      case 'q':
+        if (!cricketSet(p + 1)) Serial.println("Cricket: expected q <balls>|PAGE|PAGE...  e.g. q 2|IND 187/4|OV 18.2");
+        else if (mode != MODE_CRICKET) Serial.println("Cricket score saved; shows when the display is free");
+        break;
+      case 'v':
+        if (!cricketEvent(p + 1)) Serial.println("Cricket: expected v 4 | v 6 | v W | v 50 TEXT | v 100 TEXT | v WIN TEXT");
+        break;
+      case 'Q':
+        stopCricket();
+        break;
+      case 'w': {                      // w SSID|PASSWORD  join a home network, "w -" forget it, "w" status
+        char *q = p + 1;
+        while (*q == ' ') q++;
+        if (!*q) {
+          Serial.printf("WiFi: home network \"%s\" %s, IP %s | live scores %s, team \"%s\" | %s\n",
+                        wifiSsid, !wifiSsid[0] ? "not set" : (WiFi.status() == WL_CONNECTED) ? "connected" : "not connected",
+                        WiFi.localIP().toString().c_str(), crkAuto ? "on" : "off", crkTeam, netStatus);
+        } else if (!strcmp(q, "-")) {
+          setWifi("", "");
+        } else {
+          char *bar = strchr(q, '|');
+          if (bar) *bar++ = '\0';
+          if (strlen(q) >= sizeof(wifiSsid) || (bar && strlen(bar) >= sizeof(wifiPass))) Serial.println("WiFi: name or password too long");
+          else setWifi(q, bar ? bar : "");
+        }
+        break;
+      }
+      case 'l': {                      // l 1 [TEAM]  live scores over Wi-Fi on, "l 0" off
+        const char *q = p + 1;
+        while (*q == ' ') q++;
+        const bool on = (*q != '0');
+        if (*q) q++;
+        while (*q == ' ') q++;
+        setCricketAuto(on, q);
+        break;
+      }
       case 'f':
         eyesDumpFrame();
         break;
@@ -1454,7 +2685,7 @@ static void handleSerialConsole() {
         break;
       }
       default:
-        Serial.println("Commands: t<sec>[f] start timer | c cancel | x<text> set text | e eyes | a<text> alert until cleared | k clear alert | f dump eye frame | s status | d self-test | m<0-7> module type");
+        Serial.println("Commands: t<sec>[f] start timer | c cancel | x<text> set text | e eyes | a<text> alert until cleared | k clear alert | f dump the eyes/cricket frame | s status | d self-test | m<0-7> module type | q<balls>|PAGE|.. cricket score | v<4|6|W|50|100|WIN> [text] cricket animation | Q stop cricket | w<ssid>|<password> join home Wi-Fi, w - forget, w status | l<0|1> [team] live scores over Wi-Fi");
         break;
     }
   }
@@ -1522,6 +2753,13 @@ static void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
       Serial.printf("WiFi: client left    %02X:%02X:%02X:%02X:%02X:%02X\n", m[0], m[1], m[2], m[3], m[4], m[5]);
       break;
     }
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      Serial.printf("WiFi: joined the home network, IP %s (the control page is there too)\n",
+                    IPAddress(info.got_ip.ip_info.ip.addr).toString().c_str());
+      break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      Serial.printf("WiFi: home network not connected (reason %d), retrying\n", (int)info.wifi_sta_disconnected.reason);
+      break;
     case ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED:
       Serial.printf("WiFi: client got IP  %s\n", IPAddress(info.wifi_ap_staipassigned.ip.addr).toString().c_str());
       break;
@@ -1543,6 +2781,10 @@ void setup() {
   if (moduleTypeIdx > 7) moduleTypeIdx = MODULE_TYPE_DEFAULT;
   timerFlip = prefs.getBool("flip", false);
   idleMode  = prefs.getUChar("idle", 0) ? 1 : 0;
+  strlcpy(wifiSsid, prefs.getString("ssid", "").c_str(), sizeof(wifiSsid));
+  strlcpy(wifiPass, prefs.getString("pass", "").c_str(), sizeof(wifiPass));
+  strlcpy(crkTeam,  prefs.getString("team", "").c_str(), sizeof(crkTeam));
+  crkAuto = prefs.getBool("auto", true);
 
   // LED matrix
   P.begin();
@@ -1556,7 +2798,7 @@ void setup() {
   // Access point
   WiFi.persistent(false);
   WiFi.onEvent(onWiFiEvent);
-  WiFi.mode(WIFI_AP);
+  WiFi.mode(wifiSsid[0] ? WIFI_AP_STA : WIFI_AP);
   const bool apOk = WiFi.softAP(ssid, nullptr, WIFI_CHANNEL, 0, WIFI_MAX_CLIENTS);
   WiFi.setTxPower(WIFI_TX_POWER);   // must come after softAP; see WIFI_TX_POWER note
   WiFi.setSleep(false);             // no modem power-save: keeps beacons and replies prompt
@@ -1564,6 +2806,11 @@ void setup() {
   Serial.printf("Channel %d, TX power code %d, MAC %s\n", WIFI_CHANNEL, (int)WiFi.getTxPower(), WiFi.softAPmacAddress().c_str());
   Serial.print("Open http://");
   Serial.println(WiFi.softAPIP());
+
+  // Home network for live scores, if one is saved. The access point stays up
+  // next to it, but moves to the home network's channel.
+  if (wifiSsid[0]) wifiStartStation();
+  xTaskCreate(netTask, "net", 8192, nullptr, 1, nullptr);
 
   // Captive-portal DNS: every hostname resolves to us. Phones and laptops then
   // detect a "sign-in" network and open the page by themselves.
@@ -1671,6 +2918,108 @@ void setup() {
     request->send(200, "text/plain", "Alert cleared");
   });
 
+  // Home network for live scores: /wifi?ssid=NAME&pass=PASSWORD. An empty ssid
+  // forgets it. Without pass the saved password is kept for the same network.
+  server.on("/wifi", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("ssid")) {
+      request->send(400, "text/plain", "Missing ssid parameter");
+      return;
+    }
+    const String ssid    = request->getParam("ssid")->value();
+    const bool   hasPass = request->hasParam("pass");
+    const String pass    = hasPass ? request->getParam("pass")->value() : String();
+    if (ssid.length() >= sizeof(wifiSsid) || pass.length() >= sizeof(wifiPass) || (pass.length() > 0 && pass.length() < 8)) {
+      request->send(400, "text/plain", "Name up to 32 characters, password 8 to 64 characters");
+      return;
+    }
+
+    portENTER_CRITICAL(&cmdMux);
+    strlcpy(pendingText, ssid.c_str(), sizeof(pendingText));
+    strlcpy(pendingPass, pass.c_str(), sizeof(pendingPass));
+    pendingKeepPass = !hasPass;
+    pendingCmd      = CMD_SET_WIFI;
+    portEXIT_CRITICAL(&cmdMux);
+
+    request->send(200, "text/plain", ssid.length() ? "Joining the network" : "Network forgotten");
+  });
+
+  // Live scores over Wi-Fi: /cricketAuto?on=0|1&team=IND (team optional)
+  server.on("/cricketAuto", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("on")) {
+      request->send(400, "text/plain", "Missing on parameter");
+      return;
+    }
+    String team = request->hasParam("team") ? request->getParam("team")->value() : String();
+    team.trim();
+    if (team.length() >= sizeof(crkTeam)) {
+      request->send(400, "text/plain", "Team is too long");
+      return;
+    }
+
+    portENTER_CRITICAL(&cmdMux);
+    strlcpy(pendingText, team.c_str(), sizeof(pendingText));
+    pendingFlip = request->getParam("on")->value() == "1";
+    pendingCmd  = CMD_SET_AUTO;
+    portEXIT_CRITICAL(&cmdMux);
+
+    request->send(200, "text/plain", "Saved");
+  });
+
+  // Cricket animation: /cricketEvent?e=4|6|W|50|100|WIN&text=...
+  server.on("/cricketEvent", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("e")) {
+      request->send(400, "text/plain", "Missing e parameter");
+      return;
+    }
+    String arg = request->getParam("e")->value();
+    arg.trim();
+    if (arg != "4" && arg != "6" && arg != "W" && arg != "50" && arg != "100" && arg != "WIN") {
+      request->send(400, "text/plain", "e must be 4, 6, W, 50, 100 or WIN");
+      return;
+    }
+    if (request->hasParam("text")) {
+      arg += ' ';
+      arg += request->getParam("text")->value();
+    }
+
+    portENTER_CRITICAL(&cmdMux);
+    strncpy(pendingCricket, arg.c_str(), CRK_LINE_MAX);
+    pendingCricket[CRK_LINE_MAX] = '\0';
+    pendingCmd = CMD_CRICKET_EVENT;
+    portEXIT_CRITICAL(&cmdMux);
+
+    request->send(200, "text/plain", "Animation queued");
+  });
+
+  server.on("/cricketStop", HTTP_GET, [](AsyncWebServerRequest *request) {
+    portENTER_CRITICAL(&cmdMux);
+    pendingCmd = CMD_CRICKET_STOP;
+    portEXIT_CRITICAL(&cmdMux);
+    request->send(200, "text/plain", "Scoreboard stopped");
+  });
+
+  // Cricket score: /cricket?d=<balls>|PAGE|PAGE...  e.g. d=2|IND 187/4|OV 18.2
+  server.on("/cricket", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("d")) {
+      request->send(400, "text/plain", "Missing d parameter");
+      return;
+    }
+    const String d = request->getParam("d")->value();
+    const int bar = d.indexOf('|');
+    if (bar < 0 || bar == (int)d.length() - 1) {
+      request->send(400, "text/plain", "d must be <balls>|PAGE|PAGE...");
+      return;
+    }
+
+    portENTER_CRITICAL(&cmdMux);
+    strncpy(pendingCricket, d.c_str(), CRK_LINE_MAX);
+    pendingCricket[CRK_LINE_MAX] = '\0';
+    pendingCmd = CMD_CRICKET;
+    portEXIT_CRITICAL(&cmdMux);
+
+    request->send(200, "text/plain", "Score updated");
+  });
+
   // Scrolling text as the resting screen
   server.on("/showText", HTTP_GET, [](AsyncWebServerRequest *request) {
     portENTER_CRITICAL(&cmdMux);
@@ -1716,10 +3065,10 @@ void setup() {
     }
 
     String json;
-    json.reserve(256);
+    json.reserve(900);
     json += "{\"mode\":\"";
     json += (m == MODE_TEXT) ? "text" : (m == MODE_TIMER) ? "timer" : (m == MODE_DONE) ? "done"
-          : (m == MODE_EYES) ? "eyes" : (m == MODE_ALERT) ? "alert" : "selftest";
+          : (m == MODE_EYES) ? "eyes" : (m == MODE_ALERT) ? "alert" : (m == MODE_CRICKET) ? "cricket" : "selftest";
     json += "\",\"remaining\":";
     json += String((remainingMs + 999UL) / 1000UL);   // round up so it never shows 0 early
     json += ",\"total\":";
@@ -1738,6 +3087,30 @@ void setup() {
     json += idleMode ? "eyes" : "text";
     json += "\",\"alert\":\"";
     json += (m == MODE_ALERT || alertQueued) ? jsonEscape(alertText) : "";
+    json += "\",\"cricket\":\"";
+    if (crkActive) {
+      const uint8_t pages = crkPageCount;
+      for (uint8_t i = 0; i < pages; i++) {
+        if (i) json += " | ";
+        json += jsonEscape(crkPages[i]);
+      }
+    }
+    char net[sizeof(netStatus)];
+    portENTER_CRITICAL(&netMux);
+    memcpy(net, netStatus, sizeof(net));
+    portEXIT_CRITICAL(&netMux);
+    json += "\",\"wifi\":\"";
+    json += jsonEscape(wifiSsid);
+    json += "\",\"wifiState\":\"";
+    if (!wifiSsid[0])                       json += "off";
+    else if (WiFi.status() == WL_CONNECTED) json += "connected, " + WiFi.localIP().toString();
+    else                                    json += "not connected";
+    json += "\",\"auto\":";
+    json += crkAuto ? "true" : "false";
+    json += ",\"team\":\"";
+    json += jsonEscape(crkTeam);
+    json += "\",\"net\":\"";
+    json += jsonEscape(net);
     json += "\"}";
 
     AsyncWebServerResponse *response = request->beginResponse(200, "application/json", json);
@@ -1762,10 +3135,25 @@ void loop() {
   dnsServer.processNextRequest();
   handleSerialConsole();
   applyPendingCommand();
+  applyNetResult();
 
   const unsigned long now = millis();
 
+  // The PC script re-sends the score every few seconds. If it goes quiet, drop
+  // the scoreboard instead of showing a stale score for ever.
+  if (crkActive && now - crkLastUpdateMs > CRK_STALE_MS) {
+    Serial.println("Cricket: no update from the PC, leaving the scoreboard");
+    stopCricket();
+  }
+
   switch (mode) {
+    case MODE_CRICKET:
+      if (now - lastCrkFrameMs >= CRK_FRAME_MS) {
+        lastCrkFrameMs = now;
+        cricketTick(now);
+      }
+      break;
+
     case MODE_TEXT:
       if (P.displayAnimate()) {
         P.displayReset();
