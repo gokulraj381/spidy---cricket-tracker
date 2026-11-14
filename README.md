@@ -255,7 +255,7 @@ On Windows you can also double-click `tools\cricket_score.bat`. `Ctrl+C` stops i
 
 | Page | Example |
 |------|---------|
-| Score of the batting side | `IND 187/4` |
+| Score of the batting side, as the stadium-style score page | `IND 187/4` |
 | Overs | `OV 18.2` |
 | Chase (second innings) | `NEED 24`, then `10 BALLS` |
 | Run rate (first innings of an ODI or T20) | `CRR 8.45` |
@@ -263,7 +263,11 @@ On Windows you can also double-click `tools\cricket_score.bat`. `Ctrl+C` stops i
 | The other side's total | `AUS 210/6` |
 | Match state and situation | `STUMPS`, `SL TRAIL BY 30 RUNS` |
 
-The bottom row is the current over: one dash per ball bowled. The newest dash blinks, and the row sweeps clear when the over ends.
+The score page is laid out like a stadium board instead of a line of text: the team name top left, the runs in tall digits that use the whole height of the strip, and the wickets as a small digit bottom right. Under the team name sit six dots, one per ball bowled this over. The newest dot blinks, the next one flickers, and the row sweeps clear when the over ends.
+
+When runs are scored, `+1`, `+2` and so on takes the place of the team name for a moment, the digits that changed roll over like an odometer, and the brightness kicks up and settles back. A highlight sweeps across the score each time the page comes up.
+
+The other pages come in with one of three transitions in turn: a ripple from the left, a drop from the centre outwards, and a bar that wipes across. Overs, run rate, chase and batter pages carry a small icon (ball, bars, target, bat) where it fits.
 
 **Animations**
 
@@ -271,7 +275,7 @@ The bottom row is the current over: one dash per ball bowled. The newest dash bl
 |-------|------------|
 | Four | The ball races along the ground, a flash, then `FOUR!` |
 | Six | The ball sails up and out of the ground, fireworks, then `SIX!` |
-| Wicket | The ball hits the stumps, they fly apart, then `OUT!` flashes |
+| Wicket | The ball hops in and tips the bails off, then `OUT!` drops in letter by letter, each landing with a little hop |
 | Fifty, hundred | Sparkles, `50!` or `100!` between dancing bars, then the batter's name |
 | Result | A wave along the strip, then the result scrolls through |
 

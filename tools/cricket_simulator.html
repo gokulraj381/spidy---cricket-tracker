@@ -42,11 +42,21 @@
     <button data-e="100" data-t="KOHLI 100*">Hundred</button>
     <button data-e="WIN" data-t="IND WON BY 5 WICKETS">Win</button>
     <button class="primary" id="demo">Play demo finish</button>
+
+  </div>
+
+  <div class="row">
+    <button data-eyes="1">Eyes: round</button>
+    <button data-eyes="2">Eyes: outline</button>
+    <button data-eyes="3">Eyes: robot</button>
+    <button data-eyes="0">Back to the scoreboard</button>
   </div>
 
   <div class="row">
     <input type="text" id="payload" value="2|IND 187/4|OV 18.2|NEED 24|10 BALLS|KOHLI 72*|PANDYA 31*">
     <button id="send">Set score</button>
+    <button id="run1">+1 run</button>
+    <button id="run2">+2 runs</button>
     <button id="ball">Next ball</button>
   </div>
   <div class="row">
@@ -67,6 +77,27 @@
 <script>
 // ENGINE-START  (mirrors the "Cricket scoreboard engine" section of src/main.cpp)
 const CRK_PAGE_MS = 3500, CRK_MAIN_PAGE_MS = 6000, CRK_SCROLL_MS = 45, CRK_SLIDE_MS = 260;
+const CRK_RIPPLE_MS = 7, CRK_ROLL_STAGGER_MS = 70, CRK_SHINE_AT_MS = 1500, CRK_SHINE_MS = 650;
+const CRK_NO_ANIM = 0xFFFF;
+const CRK_DROP_MS = 5, CRK_WIPE_STEP_MS = 12, CRK_WIPE_BAR_MS = 36;
+const CRK_POP_MS = 1400, CRK_GLOW_MS = 700, CRK_BASE_INTENSITY = 5, CRK_GLOW_BOOST = 7;
+const KIND_TEXT = 0, KIND_MARQUEE = 1, KIND_DASH = 2;
+const TRANS_UP = 0, TRANS_DOWN = 1, TRANS_WIPE = 2;
+
+// Tall digits for the score: 4 columns by 7 rows, leftmost pixel first
+const BIG = [
+  [0b0110, 0b1001, 0b1001, 0b1001, 0b1001, 0b1001, 0b0110],
+  [0b0010, 0b0110, 0b0010, 0b0010, 0b0010, 0b0010, 0b0111],
+  [0b0110, 0b1001, 0b0001, 0b0010, 0b0100, 0b1000, 0b1111],
+  [0b1110, 0b0001, 0b0001, 0b0110, 0b0001, 0b0001, 0b1110],
+  [0b0010, 0b0110, 0b1010, 0b1010, 0b1111, 0b0010, 0b0010],
+  [0b1111, 0b1000, 0b1110, 0b0001, 0b0001, 0b1001, 0b0110],
+  [0b0110, 0b1000, 0b1000, 0b1110, 0b1001, 0b1001, 0b0110],
+  [0b1111, 0b0001, 0b0010, 0b0010, 0b0100, 0b0100, 0b0100],
+  [0b0110, 0b1001, 0b1001, 0b0110, 0b1001, 0b1001, 0b0110],
+  [0b0110, 0b1001, 0b1001, 0b0111, 0b0001, 0b0001, 0b0110],
+];
+const ICON_BALL = '\x01', ICON_TARGET = '\x02', ICON_BAT = '\x03', ICON_RATE = '\x04';
 const CRK_PAGES_MAX = 8, CRK_PAGE_LEN = 39, CRK_QUEUE_MAX = 4;
 const ANIM_NONE = 0, ANIM_FOUR = 1, ANIM_SIX = 2, ANIM_WICKET = 3, ANIM_FIFTY = 4, ANIM_HUNDRED = 5, ANIM_WIN = 6;
 
@@ -93,15 +124,27 @@ const FONT = {
   '/': [3, [0b001, 0b001, 0b010, 0b100, 0b100]], '-': [3, [0b000, 0b000, 0b111, 0b000, 0b000]],
   '+': [3, [0b000, 0b010, 0b111, 0b010, 0b000]], '*': [3, [0b101, 0b010, 0b101, 0b000, 0b000]],
   '.': [1, [0, 0, 0, 0, 1]], '!': [1, [1, 1, 1, 0, 1]], ':': [1, [0, 1, 0, 1, 0]],
+  '\x01': [5, [0b01110, 0b11011, 0b11011, 0b11011, 0b01110]],   // ball with its seam
+  '\x02': [5, [0b01110, 0b10001, 0b10101, 0b10001, 0b01110]],   // target
+  '\x03': [5, [0b00001, 0b00010, 0b01100, 0b11100, 0b11000]],   // bat
+  '\x04': [5, [0b00001, 0b00001, 0b00101, 0b00101, 0b10101]],   // run rate bars
+  '\x05': [3, [0b101, 0b111, 0b111, 0b101, 0b101]],             // narrow M
+  '\x06': [3, [0b101, 0b101, 0b111, 0b111, 0b101]],             // narrow W
 };
 
 const fb = new Uint8Array(32);         // frame: fb[x] bit y, x left to right, y top to bottom
 const crkText = new Uint8Array(32);
 const crkOldText = new Uint8Array(32);
 let crkPages = [], crkBalls = -1, crkActive = false;
-let crkPage = 0, crkShown = '', crkPageStartMs = 0, crkPageW = 0, crkTight = false, crkMarquee = false;
+let crkPage = 0, crkShown = '', crkDraw = '', crkPageStartMs = 0, crkPageW = 0, crkTight = false, crkMarquee = false;
+const crkColDelay = new Uint16Array(32);   // per column: ms before it starts to move, or CRK_NO_ANIM
+let crkSlideLen = 0;
+let crkKind = KIND_TEXT, crkTrans = TRANS_UP, crkTransCount = 0;
+let crkDashTeam = '', crkDashRuns = 0, crkDashWkts = -1;       // what the score screen shows
+let crkRuns = -1, crkRunsTeam = '';                            // last score received, for the +N pop
+let crkPop = false, crkPopVal = 0, crkPopMs = 0, crkGlow = false, crkGlowMs = 0, crkIntensity = CRK_BASE_INTENSITY;
 let crkSliding = false, crkSlideStartMs = 0, crkWiping = false, crkWipeMs = 0, crkNewBall = false, crkNewBallMs = 0;
-let crkAnim = ANIM_NONE, crkAnimStartMs = 0, crkAnimText = '', crkQueue = [], crkParts = [], crkPartsLive = false;
+let crkAnim = ANIM_NONE, crkAnimStartMs = 0, crkAnimText = '', crkQueue = [];
 
 const random = (a, b) => a + Math.floor(Math.random() * (b - a));
 const round = (v) => Math.sign(v) * Math.round(Math.abs(v));          // like C roundf
@@ -125,7 +168,6 @@ function crkDrawText(layer, s, x, y, tight) {
     x += w + 1;
   }
 }
-function crkCentered(s, y) { crkDrawText(fb, s, Math.trunc((32 - crkTextWidth(s, false)) / 2), y, false); }
 function crkFill() { fb.fill(0xFF); }
 function crkInvert() { for (let x = 0; x < 32; x++) fb[x] = ~fb[x] & 0xFF; }
 function crkBall(x, y) { const bx = round(x), by = round(y); fbSet(bx, by); fbSet(bx + 1, by); fbSet(bx, by + 1); fbSet(bx + 1, by + 1); }
@@ -191,31 +233,35 @@ function crkAnimSix(t) {
   return false;
 }
 
+// WICKET: the ball hops in and tips the bails off, then OUT! drops in letter
+// by letter, each one landing with a little hop.
 function crkAnimWicket(t) {
   const STUMP_X = [24, 26, 28];
-  if (t < 700) {
-    for (const sx of STUMP_X) for (let y = 2; y < 8; y++) fbSet(sx, y);
-    fbSet(25, 1); fbSet(27, 1);
-    const bx = -2 + 24 * (t / 700);
-    crkBall(bx, 4);
-    for (let i = 1; i <= 3; i++) fbSet(Math.trunc(bx) - 2 * i, 5 - (i & 1));
-  } else if (t < 1800) {
-    if (!crkPartsLive) {
-      crkPartsLive = true;
-      crkParts = [];
-      for (const sx of STUMP_X) for (let y = 2; y < 8; y++)
-        crkParts.push({ x: sx, y: y, vx: random(-90, 60) / 100, vy: -random(10, 110) / 100 });
-      crkParts.push({ x: 25, y: 1, vx: -0.5, vy: -2.0 });
-      crkParts.push({ x: 27, y: 1, vx: 0.7, vy: -2.2 });
+  if (t < 1500) {
+    const hit = t >= 900;
+    const wobble = (hit && t < 1300) ? ((Math.floor((t - 900) / 70) & 1) ? 1 : -1) : 0;   // the stumps shiver
+    for (const sx of STUMP_X) for (let y = 2; y < 8; y++) fbSet(sx + wobble, y);
+    if (!hit) {
+      fbSet(25, 1); fbSet(27, 1);                                                // bails
+      const u = t / 900;
+      crkBall(-2 + 23 * u, 6 - 4 * Math.abs(Math.sin(u * 3 * Math.PI)));         // three hops
+    } else {
+      const s = (t - 900) / 600;
+      fbSet(round(25 - 5 * s), round(1 - 12 * s + 18 * s * s));                  // bails pop up and tumble away
+      fbSet(round(27 + 4 * s), round(1 - 12 * s + 18 * s * s));
+      crkBall(21 - 3 * s, 6);
     }
-    if (t < 790) crkFill();
-    for (const p of crkParts) {
-      p.x += p.vx; p.y += p.vy; p.vy += 0.09;
-      if (t >= 790) fbSet(round(p.x), round(p.y));
+  } else if (t < 3000) {
+    const word = 'OUT!';
+    let x = Math.trunc((32 - crkTextWidth(word, false)) / 2);
+    for (let i = 0; i < word.length; i++) {
+      const lt = t - 1500 - i * 150;                                             // each letter drops in turn
+      if (lt >= 0) {
+        const y = (lt < 200) ? -5 + Math.floor(lt * 7 / 200) : (lt < 280) ? 2 : (lt < 360) ? 0 : 1;   // fall, squash, hop, settle
+        crkDrawText(fb, word[i], x, y, false);
+      }
+      x += FONT[word[i]][0] + 1;
     }
-  } else if (t < 3700) {
-    crkCentered('OUT!', 1);
-    if (Math.floor((t - 1800) / 240) & 1) crkInvert();
   } else return true;
   return false;
 }
@@ -263,75 +309,237 @@ function crkRunAnim(now) {
   }
 }
 
-function crkBeginPage(now, slide) {
+// Swap the label of a page for a small icon where that reads better.
+function crkDecorate(s) {
+  if (s.startsWith('OV ')) return ICON_BALL + s.slice(2);
+  if (s.startsWith('CRR ')) return ICON_RATE + s.slice(3);
+  if (s.startsWith('NEED ') && crkTextWidth(ICON_TARGET + ' ' + s, true) <= 32) return ICON_TARGET + ' ' + s;
+  if (s.endsWith('*') && crkTextWidth(ICON_BAT + ' ' + s, true) <= 32) return ICON_BAT + ' ' + s;
+  return s;
+}
+
+// "IND 187/4" or "IND 187" -> team, runs, wickets (-1 = none given). Null if the
+// page is not a score, or the runs do not fit three tall digits.
+function crkParseScore(s) {
+  const sp = s.lastIndexOf(' ');
+  if (sp <= 0) return null;
+  const rest = s.slice(sp + 1);
+  let i = 0, runs = 0, wkts = -1;
+  while (i < rest.length && rest[i] >= '0' && rest[i] <= '9') runs = runs * 10 + (rest.charCodeAt(i++) - 48);
+  if (i === 0 || i > 3) return null;
+  if (i < rest.length) {
+    if (rest[i] !== '/' || i + 2 !== rest.length || rest[i + 1] < '0' || rest[i + 1] > '9') return null;
+    wkts = rest.charCodeAt(i + 1) - 48;
+  }
+  return { team: s.slice(0, sp), runs: runs, wkts: wkts };
+}
+
+// The same digits 3 columns wide, for a three digit score that has to leave
+// room for "/wickets"
+const BIG3 = [
+  [0b111, 0b101, 0b101, 0b101, 0b101, 0b101, 0b111],
+  [0b010, 0b110, 0b010, 0b010, 0b010, 0b010, 0b111],
+  [0b111, 0b001, 0b001, 0b111, 0b100, 0b100, 0b111],
+  [0b111, 0b001, 0b001, 0b111, 0b001, 0b001, 0b111],
+  [0b101, 0b101, 0b101, 0b111, 0b001, 0b001, 0b001],
+  [0b111, 0b100, 0b100, 0b111, 0b001, 0b001, 0b111],
+  [0b111, 0b100, 0b100, 0b111, 0b101, 0b101, 0b111],
+  [0b111, 0b001, 0b001, 0b010, 0b010, 0b010, 0b010],
+  [0b111, 0b101, 0b101, 0b111, 0b101, 0b101, 0b111],
+  [0b111, 0b101, 0b101, 0b111, 0b001, 0b001, 0b111],
+];
+
+function crkDrawBig(layer, digit, x, y, narrow) {
+  const w = narrow ? 3 : 4, rows = narrow ? BIG3[digit] : BIG[digit];
+  for (let r = 0; r < 7; r++)
+    for (let c = 0; c < w; c++)
+      if ((rows[r] >> (w - 1 - c)) & 1) setPx(layer, x + c, y + r);
+}
+
+// The score screen: team name top left (the over dots go under it), runs in
+// tall digits, then a tall slash and the wickets as a small digit: "187/4".
+//   with wickets:    x 0..10 team | ..23 runs | 25..27 slash | 29..31 wickets
+//   without wickets: x 0..10 team | ..25 runs
+// Three digits next to a slash are drawn 3 columns wide so that all of it fits.
+function crkDrawDash(layer) {
+  let team = crkDashTeam;
+  if (crkTextWidth(team, true) > 11) team = team.replace(/M/g, '\x05').replace(/W/g, '\x06');
+  while (team.length > 1 && crkTextWidth(team, true) > 11) team = team.slice(0, -1);
+  crkDrawText(layer, team, Math.trunc((11 - crkTextWidth(team, true)) / 2), 0, true);
+  const digits = String(crkDashRuns);
+  const hasWkts = crkDashWkts >= 0;
+  const narrow = hasWkts && digits.length >= 3;
+  const step = narrow ? 4 : 5;
+  let x = (hasWkts ? 24 : 26) - (digits.length * step - 1);
+  for (const ch of digits) { crkDrawBig(layer, ch.charCodeAt(0) - 48, x, 0, narrow); x += step; }
+  if (hasWkts) {
+    layer[27] |= 0b00000011;   // slash: rows 0..1, 2..4 and 5..6, one column each
+    layer[26] |= 0b00011100;
+    layer[25] |= 0b01100000;
+    crkDrawText(layer, String(crkDashWkts), 29, 2, false);
+  }
+}
+
+// Everything on the current page that does not move by itself.
+function crkDrawStatic(layer) {
+  if (crkKind === KIND_DASH) crkDrawDash(layer);
+  else crkDrawText(layer, crkDraw, Math.trunc((32 - crkPageW) / 2), 1, crkTight);
+}
+
+// Put page `crkPage` on the display. how: 0 = just show it, 1 = page change
+// (one of three transitions, in turn), 2 = same page with new content (only
+// the parts that changed roll over, one after another, like an odometer).
+function crkBeginPage(now, how) {
   crkShown = crkPages[crkPage] || '';
   crkPageStartMs = now;
   crkTight = false;
-  crkPageW = crkTextWidth(crkShown, false);
-  if (crkPageW > 32) {
-    const tightW = crkTextWidth(crkShown, true);
-    if (tightW <= 32) { crkTight = true; crkPageW = tightW; }
+  const sc = (crkPage === 0) ? crkParseScore(crkShown) : null;
+  if (sc) {
+    crkKind = KIND_DASH;
+    crkDashTeam = sc.team; crkDashRuns = sc.runs; crkDashWkts = sc.wkts;
+    crkMarquee = false;
+  } else {
+    crkDraw = crkDecorate(crkShown);
+    crkPageW = crkTextWidth(crkDraw, false);
+    if (crkPageW > 32) {
+      const tightW = crkTextWidth(crkDraw, true);
+      if (tightW <= 32) { crkTight = true; crkPageW = tightW; }
+    }
+    crkMarquee = crkPageW > 32;
+    crkKind = crkMarquee ? KIND_MARQUEE : KIND_TEXT;
   }
-  crkMarquee = crkPageW > 32;
-  crkSliding = slide && !crkMarquee;
-  if (crkSliding) { crkOldText.set(crkText); crkSlideStartMs = now; }
+  crkSliding = false;
+  if (how === 0 || crkMarquee) return;
+
+  const fresh = new Uint8Array(32);
+  crkDrawStatic(fresh);
+  crkOldText.set(crkText);
+  crkSlideStartMs = now;
+  if (how === 2) {
+    crkTrans = TRANS_UP;
+    let group = -1, wasChanged = false;
+    for (let x = 0; x < 32; x++) {
+      const changed = fresh[x] !== crkText[x];
+      if (changed && !wasChanged) group++;
+      crkColDelay[x] = changed ? group * CRK_ROLL_STAGGER_MS : CRK_NO_ANIM;
+      wasChanged = changed;
+    }
+    if (group < 0) return;
+    crkSlideLen = group * CRK_ROLL_STAGGER_MS + CRK_SLIDE_MS;
+  } else {
+    crkTrans = crkTransCount++ % 3;
+    for (let x = 0; x < 32; x++) {
+      crkColDelay[x] = (crkTrans === TRANS_UP) ? x * CRK_RIPPLE_MS                      // ripple, left to right
+                     : (crkTrans === TRANS_DOWN) ? Math.abs(2 * x - 31) * CRK_DROP_MS   // drops in, centre first
+                     : x * CRK_WIPE_STEP_MS;                                            // a bar wipes across
+    }
+    crkSlideLen = (crkTrans === TRANS_UP) ? 31 * CRK_RIPPLE_MS + CRK_SLIDE_MS
+                : (crkTrans === TRANS_DOWN) ? 31 * CRK_DROP_MS + CRK_SLIDE_MS
+                : 31 * CRK_WIPE_STEP_MS + CRK_WIPE_BAR_MS;
+  }
+  crkSliding = true;
 }
 
 function crkRenderPage(now) {
   if (crkPages.length === 0) return;
-  if (crkPage >= crkPages.length) { crkPage = 0; crkBeginPage(now, true); }
-  else if (crkPages[crkPage] !== crkShown) crkBeginPage(now, true);
+  if (crkPage >= crkPages.length) { crkPage = 0; crkBeginPage(now, 1); }
+  else if (crkPages[crkPage] !== crkShown) crkBeginPage(now, 2);
 
-  const dots = crkBalls >= 0, textY = dots ? 0 : 1, elapsed = now - crkPageStartMs;
+  const elapsed = now - crkPageStartMs;
   let done;
   crkText.fill(0);
   if (crkMarquee) {
     const x = 32 - Math.floor(elapsed / CRK_SCROLL_MS);
-    crkDrawText(crkText, crkShown, x, textY, false);
+    crkDrawText(crkText, crkDraw, x, 1, false);
     done = x + crkPageW < 0;
   } else {
-    crkDrawText(crkText, crkShown, Math.trunc((32 - crkPageW) / 2), textY, crkTight);
+    crkDrawStatic(crkText);
     done = elapsed >= (crkPage === 0 ? CRK_MAIN_PAGE_MS : CRK_PAGE_MS);
   }
 
-  if (crkSliding && now - crkSlideStartMs >= CRK_SLIDE_MS) crkSliding = false;
-  const mask = dots ? 0x3F : 0x7F;
-  if (crkSliding) {
-    const k = Math.floor((now - crkSlideStartMs) * 7 / CRK_SLIDE_MS);
-    for (let x = 0; x < 32; x++) fb[x] = ((crkOldText[x] >> k) | (crkText[x] << (7 - k))) & mask;
-  } else {
-    for (let x = 0; x < 32; x++) fb[x] = crkText[x] & mask;
+  if (crkSliding && now - crkSlideStartMs >= crkSlideLen) crkSliding = false;
+  for (let x = 0; x < 32; x++) {
+    let v = crkText[x];
+    const d = crkColDelay[x];
+    if (crkSliding && d !== CRK_NO_ANIM) {
+      const se = now - crkSlideStartMs;
+      if (se < d) {
+        v = crkOldText[x];                                        // this column has not started yet
+      } else if (crkTrans === TRANS_WIPE) {
+        if (se - d < CRK_WIPE_BAR_MS) v = 0x7F;                   // the bar itself
+      } else if (se - d < CRK_SLIDE_MS) {
+        const k = Math.floor((se - d) * 7 / CRK_SLIDE_MS);
+        v = (crkTrans === TRANS_DOWN) ? (crkOldText[x] << k) | (crkText[x] >> (7 - k))
+                                      : (crkOldText[x] >> k) | (crkText[x] << (7 - k));
+      }
+    }
+    fb[x] = v & 0x7F;
   }
 
-  if (dots) {
-    if (crkWiping && now - crkWipeMs >= 700) crkWiping = false;
-    if (crkNewBall && now - crkNewBallMs >= 1500) crkNewBall = false;
-    for (let i = 0; i < 6; i++) {
-      let lit = i < crkBalls;
-      if (crkWiping) lit = i >= Math.floor((now - crkWipeMs) / 100);
-      else if (lit && crkNewBall && i === crkBalls - 1) lit = (Math.floor((now - crkNewBallMs) / 150) & 1) === 0;
-      if (lit) for (let x = 2 + 5 * i; x < 6 + 5 * i; x++) fbSet(x, 7);
+  // A slanted highlight sweeps across the score page once each time it is up
+  if (crkPage === 0 && !crkMarquee && !crkSliding && elapsed >= CRK_SHINE_AT_MS && elapsed < CRK_SHINE_AT_MS + CRK_SHINE_MS) {
+    const pos = -4 + Math.floor((elapsed - CRK_SHINE_AT_MS) * 40 / CRK_SHINE_MS);
+    for (let y = 0; y < 7; y++) {
+      for (let dx = 0; dx < 2; dx++) {
+        const x = pos + dx + ((6 - y) >> 1);
+        if (x >= 0 && x < 32) fb[x] ^= (1 << y);
+      }
     }
   }
+
+  if (crkKind === KIND_DASH) {
+    // Runs just scored: "+N" takes the place of the team name for a moment
+    if (crkPop && now - crkPopMs >= CRK_POP_MS) crkPop = false;
+    if (crkPop) {
+      const t = now - crkPopMs;
+      for (let x = 0; x < 11; x++) fb[x] &= ~0x1F;
+      if (t >= 480 || (Math.floor(t / 120) & 1) === 0) {          // flickers in, then holds
+        const pop = new Uint8Array(32);
+        const text = '+' + crkPopVal;
+        crkDrawText(pop, text, Math.trunc((11 - crkTextWidth(text, false)) / 2), (t < 150) ? 5 - Math.floor(t * 5 / 150) : 0, false);
+        for (let x = 0; x < 11; x++) fb[x] |= pop[x] & 0x1F;
+      }
+    }
+
+    // Over dots under the team name: one per ball bowled this over
+    if (crkBalls >= 0) {
+      if (crkWiping && now - crkWipeMs >= 700) crkWiping = false;
+      if (crkNewBall && now - crkNewBallMs >= 1500) crkNewBall = false;
+      for (let x = 0; x < 11; x++) fb[x] &= 0x3F;
+      for (let i = 0; i < 6; i++) {
+        let lit = i < crkBalls;
+        if (crkWiping) lit = i >= Math.floor((now - crkWipeMs) / 100);               // the finished over sweeps away
+        else if (lit && crkNewBall && i === crkBalls - 1) lit = (Math.floor((now - crkNewBallMs) / 150) & 1) === 0;
+        if (lit) { fbSet(2 * i, 6); fbSet(2 * i, 7); }
+      }
+      if (!crkWiping && crkBalls < 6 && (Math.floor(now / 150) & 3) === 0) fbSet(2 * crkBalls, 7);   // next ball
+    }
+  }
+
+  // Brightness kicks up when runs are scored and settles back
+  crkIntensity = CRK_BASE_INTENSITY;
+  if (crkGlow && now - crkGlowMs >= CRK_GLOW_MS) crkGlow = false;
+  if (crkGlow) crkIntensity += Math.floor(CRK_GLOW_BOOST * (CRK_GLOW_MS - (now - crkGlowMs)) / CRK_GLOW_MS);
 
   if (done) {
     const next = (crkPage + 1) % crkPages.length;
     if (next === crkPage && !crkMarquee) crkPageStartMs = now;
-    else { crkPage = next; crkBeginPage(now, true); }
+    else { crkPage = next; crkBeginPage(now, 1); }
   }
 }
 
 function cricketTick(now) {
   fb.fill(0);
+  if (crkAnim !== ANIM_NONE || crkQueue.length > 0) crkIntensity = CRK_BASE_INTENSITY;
   if (crkAnim !== ANIM_NONE && crkRunAnim(now)) {
     crkAnim = ANIM_NONE;
     fb.fill(0); crkText.fill(0);
     crkPage = 0;
-    crkBeginPage(now, false);
+    crkBeginPage(now, 0);
   }
   if (crkAnim === ANIM_NONE && crkQueue.length > 0) {
     const ev = crkQueue.shift();
-    crkAnim = ev.anim; crkAnimStartMs = now; crkPartsLive = false; crkAnimText = ev.text;
+    crkAnim = ev.anim; crkAnimStartMs = now; crkAnimText = ev.text;
     fb.fill(0);
     crkRunAnim(now);
   }
@@ -349,7 +557,14 @@ function cricketSet(payload, now) {
   if (crkActive && crkBalls > 0 && balls === 0) { crkWiping = true; crkWipeMs = now; }
   else if (crkActive && crkBalls >= 0 && balls > crkBalls) { crkNewBall = true; crkNewBallMs = now; }
   crkPages = pages; crkBalls = balls;
-  if (!crkActive) { crkActive = true; crkPage = 0; crkText.fill(0); crkBeginPage(now, false); }
+  const sc = crkParseScore(pages[0]);
+  if (sc && crkRuns >= 0 && sc.team === crkRunsTeam && sc.runs > crkRuns && sc.runs - crkRuns <= 9) {
+    crkPop = true; crkPopVal = sc.runs - crkRuns; crkPopMs = now;
+    crkGlow = true; crkGlowMs = now;
+  }
+  crkRuns = sc ? sc.runs : -1;
+  crkRunsTeam = sc ? sc.team : '';
+  if (!crkActive) { crkActive = true; crkPage = 0; crkText.fill(0); crkBeginPage(now, 0); }
   return true;
 }
 
@@ -360,12 +575,114 @@ function cricketEvent(code, text) {
   crkQueue.push({ anim: a, text: (text || '').toUpperCase().slice(0, CRK_PAGE_LEN) });
   return true;
 }
+// ── Eye styles: prototypes for a new look for the resting eyes ───────────────
+// All three keep what the firmware eyes do now: glance to one side, hold two
+// seconds, glance to the other, and blink now and then. Not in the firmware yet.
+const EYES_FRAME_MS = 25, EYES_HOLD_MS = 2000, EYES_BLINK_MS = 220, EYES_HAPPY_MS = 1000;
+const EYES_ROUND = 1, EYES_OUTLINE = 2, EYES_ROBOT = 3;
+let eyeLook = 1, eyePos = 1, eyeVel = 0;                   // glance target (-1 left, +1 right) and where the eyes are
+let eyeNextSweepMs = 0, eyeLastFrameMs = 0;
+let eyeBlinking = false, eyeBlinkStartMs = 0, eyeNextBlinkMs = 0;
+let eyeHappy = false, eyeHappyStartMs = 0, eyeNextHappyMs = 0;
+
+function fbClear(x, y) { if (x >= 0 && x < 32 && y >= 0 && y < 8) fb[x] &= ~(1 << y); }
+
+// Filled disc of radius r around (cx, 3.5), cut down to `half` rows above and below the middle (the lids).
+function eyeDisc(cx, r, half, set) {
+  for (let y = 0; y < 8; y++) {
+    const dy = y - 3.5;
+    if (Math.abs(dy) > half) continue;
+    for (let x = Math.floor(cx - 5); x <= Math.ceil(cx + 5); x++) {
+      const dx = x - cx;
+      if (dx * dx + dy * dy <= r * r) { if (set) fbSet(x, y); else fbClear(x, y); }
+    }
+  }
+}
+
+// 1. Round: big cartoon eyes, a dark pupil that slides, a glint in its corner.
+function eyesRound(pos, blink) {
+  const half = Math.max(0.5, 3.5 * (1 - blink));
+  for (const base of [8.5, 22.5]) {
+    const cx = base + Math.round(pos);                     // the whole eye drifts a pixel
+    eyeDisc(cx, 3.9, half, true);
+    if (blink < 0.5) {
+      const ux = Math.round(cx - 1.5 + pos * 2);           // pupil, 3 x 3, a little low
+      for (let x = ux; x < ux + 3; x++) for (let y = 3; y < 6; y++) fbClear(x, y);
+      fbSet(ux, 3);                                        // glint
+    }
+  }
+}
+
+// 2. Outline: hollow rings like an owl's, with a solid pupil inside.
+function eyesOutline(pos, blink) {
+  const half = Math.max(0.5, 3.5 * (1 - blink));
+  for (const base of [8.5, 22.5]) {
+    const cx = base + Math.round(pos * 2);
+    eyeDisc(cx, 3.9, half, true);
+    if (blink < 0.6) {
+      eyeDisc(cx, 2.8, half - 1, false);                   // hollow it out
+      const ux = Math.round(cx - 1 + pos * 1.5);           // pupil, 2 x 2
+      fbSet(ux, 3); fbSet(ux + 1, 3); fbSet(ux, 4); fbSet(ux + 1, 4);
+    }
+  }
+}
+
+// 3. Robot: solid blocks with no pupils. The eyes themselves slide, the one on
+// the far side grows and the near one shrinks, and now and then they smile.
+function eyesRobot(pos, blink, happy) {
+  for (const side of [-1, 1]) {
+    const w = 7 - Math.round(side * pos), hFull = 6 - Math.round(side * pos);
+    const cx = (side < 0 ? 9 : 22) + Math.round(pos * 3);
+    const h = Math.max(1, Math.round(hFull * (1 - blink)));
+    const x0 = cx - (w >> 1), y0 = ((8 - hFull) >> 1) + ((hFull - h) >> 1);
+    for (let x = x0; x < x0 + w; x++) {
+      for (let y = y0; y < y0 + h; y++) {
+        const corner = (h >= 3) && (x === x0 || x === x0 + w - 1) && (y === y0 || y === y0 + h - 1);
+        if (!corner) fbSet(x, y);
+      }
+    }
+    if (happy && h >= 5) {                                 // smile: keep an arch, drop the rest
+      for (let x = x0; x < x0 + w; x++) for (let y = y0 + 3; y < y0 + h; y++) fbClear(x, y);
+      for (let x = x0 + 2; x < x0 + w - 2; x++) fbClear(x, y0 + 2);
+    }
+  }
+}
+
+function eyesTick(now, style) {
+  if (now - eyeLastFrameMs < EYES_FRAME_MS) return;
+  eyeLastFrameMs = now;
+
+  let blink = 0;                                           // 0 open .. 1 shut
+  if (!eyeBlinking && now >= eyeNextBlinkMs) { eyeBlinking = true; eyeBlinkStartMs = now; eyeNextBlinkMs = now + random(2000, 6000); }
+  if (eyeBlinking) {
+    const t = (now - eyeBlinkStartMs) / EYES_BLINK_MS;
+    if (t >= 1) eyeBlinking = false; else blink = 1 - Math.abs(2 * t - 1);
+  }
+  if (!eyeBlinking && now >= eyeNextSweepMs) { eyeLook = -eyeLook; eyeNextSweepMs = now + EYES_HOLD_MS; }
+  if (!eyeHappy && !eyeBlinking && now >= eyeNextHappyMs) { eyeHappy = true; eyeHappyStartMs = now; eyeNextHappyMs = now + random(7000, 12000); }
+  if (eyeHappy && now - eyeHappyStartMs >= EYES_HAPPY_MS) eyeHappy = false;
+  if (style === EYES_ROBOT) {                              // robot: left, right, centre, then two blinks, on a 5.2 s loop
+    const t = now % 5200;
+    eyeLook = t < 1500 ? -1 : t < 3000 ? 1 : 0;
+    blink = 0;
+    for (const s of [3600, 4000]) if (t >= s && t < s + EYES_BLINK_MS) blink = 1 - Math.abs(2 * (t - s) / EYES_BLINK_MS - 1);
+    eyeHappy = false;
+  }
+
+  eyeVel = (eyeVel + (eyeLook - eyePos) * 0.15) * 0.6;     // the same spring as the firmware pupils
+  eyePos += eyeVel;
+
+  fb.fill(0);
+  if (style === EYES_ROUND) eyesRound(eyePos, blink);
+  else if (style === EYES_OUTLINE) eyesOutline(eyePos, blink);
+  else eyesRobot(eyePos, blink, eyeHappy);
+}
 // ENGINE-END
 
 // ── Page: clock, canvas and controls ──────────────────────────────────────────
 const canvas = document.getElementById('led');
 const ctx = canvas.getContext('2d');
-let simNow = 1000, lastReal = performance.now(), lastTick = 0;
+let simNow = 1000, lastReal = performance.now(), lastTick = 0, eyeStyle = 0;
 
 function draw() {
   const cell = canvas.width / 32;
@@ -376,8 +693,9 @@ function draw() {
       const on = (fb[x] >> y) & 1;
       ctx.beginPath();
       ctx.arc((x + 0.5) * cell, (y + 0.5) * cell, cell * 0.36, 0, Math.PI * 2);
-      ctx.fillStyle = on ? '#ff2a1a' : '#1c0806';
-      if (on) { ctx.shadowColor = '#ff3b2a'; ctx.shadowBlur = cell * 0.5; } else { ctx.shadowBlur = 0; }
+      const glow = (crkIntensity - CRK_BASE_INTENSITY) / CRK_GLOW_BOOST;        // 0 = normal, 1 = full kick
+      ctx.fillStyle = on ? `rgb(255, ${Math.round(42 + 120 * glow)}, ${Math.round(26 + 70 * glow)})` : '#1c0806';
+      if (on) { ctx.shadowColor = '#ff3b2a'; ctx.shadowBlur = cell * (0.5 + 0.9 * glow); } else { ctx.shadowBlur = 0; }
       ctx.fill();
     }
   }
@@ -393,19 +711,24 @@ function frame(real) {
   const paused = document.getElementById('pause').checked;
   if (!paused) simNow += (real - lastReal) * speed;
   lastReal = real;
-  if (simNow - lastTick >= 33) {              // the firmware draws about 30 frames a second
+  if (simNow - lastTick >= (eyeStyle ? EYES_FRAME_MS : 33)) {   // the firmware draws the scoreboard at 30 frames a second, the eyes at 40
     lastTick = simNow;
-    cricketTick(simNow);
+    if (eyeStyle) eyesTick(simNow, eyeStyle); else cricketTick(simNow);
     draw();
-    document.getElementById('state').textContent = crkAnim === ANIM_NONE
-      ? `page ${crkPage + 1}/${crkPages.length}: ${crkShown}${crkMarquee ? '  (scrolling)' : ''}`
+    document.getElementById('state').textContent = eyeStyle
+      ? 'eyes prototype: ' + ['', 'round', 'outline', 'robot'][eyeStyle] + (eyeLook > 0 ? ', looking right' : ', looking left')
+      : crkAnim === ANIM_NONE
+      ? `page ${crkPage + 1}/${crkPages.length}: ${crkShown}${crkMarquee ? '  (scrolling)' : ''}   brightness ${crkIntensity}/15`
       : `animation: ${NAMES[crkAnim]}`;
   }
   requestAnimationFrame(frame);
 }
 
 document.querySelectorAll('button[data-e]').forEach((btn) =>
-  btn.addEventListener('click', () => cricketEvent(btn.dataset.e, btn.dataset.t || '')));
+  btn.addEventListener('click', () => { eyeStyle = 0; cricketEvent(btn.dataset.e, btn.dataset.t || ''); }));
+
+document.querySelectorAll('button[data-eyes]').forEach((btn) =>
+  btn.addEventListener('click', () => { eyeStyle = +btn.dataset.eyes; crkIntensity = CRK_BASE_INTENSITY; }));
 
 document.getElementById('send').addEventListener('click', () => {
   if (!cricketSet(document.getElementById('payload').value, simNow)) alert('Expected <balls>|PAGE|PAGE...');
@@ -423,6 +746,15 @@ document.getElementById('ball').addEventListener('click', () => {
   box.value = next + rest;
   cricketSet(box.value, simNow);
 });
+
+// "+1 run" / "+2 runs": bump the score on the first page, to see the digits roll and the +N pop
+function addRuns(n) {
+  const box = document.getElementById('payload');
+  box.value = box.value.replace(/\|([^|]*? )(\d+)/, (m, team, runs) => '|' + team + (+runs + n));
+  cricketSet(box.value, simNow);
+}
+document.getElementById('run1').addEventListener('click', () => addRuns(1));
+document.getElementById('run2').addEventListener('click', () => addRuns(2));
 
 // The same made-up finish as "cricket_score.py --demo"
 const DEMO = [

@@ -43,14 +43,14 @@ const uint16_t BAR_LEVELS = BAR_ROWS * 8;      // 256 LEDs in total
 //  Wi-Fi access point
 // ─────────────────────────────────────────────────────────────────────────────
 const char *ssid = "ESP32C3 LED_MATRIX";
-#define WIFI_CHANNEL     1
+#define WIFI_CHANNEL     11
 #define WIFI_MAX_CLIENTS 4
 #define DNS_PORT         53
 // Transmit power. Small boards with a PCB-trace antenna (ESP32-C3 SuperMini and
 // similar) are often invisible or refuse connections at full power because the
 // antenna is mismatched. 8.5 dBm is the widely used fix and still covers a room.
 // Boards with a proper or external antenna can go up to WIFI_POWER_19_5dBm.
-#define WIFI_TX_POWER    WIFI_POWER_8_5dBm
+#define WIFI_TX_POWER    WIFI_POWER_19_5dBm
 
 AsyncWebServer server(80);
 DNSServer      dnsServer;   // answers every hostname with our IP (captive portal)
@@ -169,17 +169,35 @@ bool          alertQueued  = false;  // arrived during a timer; shown when the t
 #define CRK_PAGE_MS      3500UL     // how long a page that fits the strip stays up
 #define CRK_MAIN_PAGE_MS 6000UL     // the first page (the score) stays longer
 #define CRK_SCROLL_MS    45UL       // ms per pixel for pages wider than the strip
-#define CRK_SLIDE_MS     260UL      // page-change slide
+#define CRK_SLIDE_MS     260UL      // time one column takes to roll from the old page to the new
+#define CRK_RIPPLE_MS    7UL        // page change: each column starts this much after its left neighbour
+#define CRK_ROLL_STAGGER_MS 70UL    // score change: each changed character starts this much after the last
+#define CRK_SHINE_AT_MS  1500UL     // the highlight crosses the score page this long after it comes up
+#define CRK_SHINE_MS     650UL
+#define CRK_NO_ANIM      0xFFFF     // column delay value: this column does not move
+#define CRK_DROP_MS      5UL        // drop-in transition: delay per column away from the centre
+#define CRK_WIPE_STEP_MS 12UL       // wipe transition: delay per column
+#define CRK_WIPE_BAR_MS  36UL       // wipe transition: how long the bar stays on a column
+#define CRK_POP_MS       1400UL     // how long "+N" replaces the team name after runs are scored
+#define CRK_GLOW_MS      700UL      // brightness kick after runs are scored
+#define CRK_BASE_INTENSITY 5        // normal brightness, 0..15
+#define CRK_GLOW_BOOST   7          // added to it at the start of the kick
+#define CRK_NARROW_M     '\x05'
+#define CRK_NARROW_W     '\x06'
+enum CrkKind  : uint8_t { KIND_TEXT, KIND_MARQUEE, KIND_DASH };       // how the current page is drawn
+enum CrkTrans : uint8_t { TRANS_UP, TRANS_DOWN, TRANS_WIPE };         // how it came in
+#define CRK_ICON_BALL    '\x01'     // extra glyphs in the font
+#define CRK_ICON_TARGET  '\x02'
+#define CRK_ICON_BAT     '\x03'
+#define CRK_ICON_RATE    '\x04'
 #define CRK_STALE_MS     180000UL   // no update for this long: the PC script is gone, back to idle
 #define CRK_PAGES_MAX    8
 #define CRK_PAGE_LEN     39
 #define CRK_LINE_MAX     239        // longest "q ..." payload
 #define CRK_QUEUE_MAX    4
-#define CRK_PARTS        20         // flying stump pixels
 
 enum CrkAnim : uint8_t { ANIM_NONE, ANIM_FOUR, ANIM_SIX, ANIM_WICKET, ANIM_FIFTY, ANIM_HUNDRED, ANIM_WIN };
 struct CrkEvent { CrkAnim anim; char text[CRK_PAGE_LEN + 1]; };
-struct CrkPart  { float x, y, vx, vy; };
 
 char          crkPages[CRK_PAGES_MAX][CRK_PAGE_LEN + 1];
 uint8_t       crkPageCount    = 0;
@@ -190,6 +208,24 @@ unsigned long lastCrkFrameMs  = 0;
 
 uint8_t       crkPage         = 0;       // page on the display
 char          crkShown[CRK_PAGE_LEN + 1] = "";
+char          crkDraw[CRK_PAGE_LEN + 3]  = "";   // crkShown as drawn, with an icon where one fits
+uint16_t      crkColDelay[32];           // per column: ms before it starts to move, or CRK_NO_ANIM
+unsigned long crkSlideLen     = 0;
+CrkKind       crkKind         = KIND_TEXT;
+CrkTrans      crkTrans        = TRANS_UP;
+uint8_t       crkTransCount   = 0;
+char          crkDashTeam[CRK_PAGE_LEN + 1] = "";   // what the score screen shows
+int           crkDashRuns     = 0;
+int           crkDashWkts     = -1;
+int           crkRuns         = -1;      // last score received, for the +N pop
+char          crkRunsTeam[CRK_PAGE_LEN + 1] = "";
+bool          crkPop          = false;
+int           crkPopVal       = 0;
+unsigned long crkPopMs        = 0;
+bool          crkGlow         = false;
+unsigned long crkGlowMs       = 0;
+uint8_t       crkIntensity      = CRK_BASE_INTENSITY;   // wanted
+uint8_t       crkIntensityShown = CRK_BASE_INTENSITY;   // set on the display
 unsigned long crkPageStartMs  = 0;
 int           crkPageW        = 0;
 bool          crkTight        = false;   // narrow word gaps so the page just fits
@@ -208,8 +244,6 @@ unsigned long crkAnimStartMs  = 0;
 char          crkAnimText[CRK_PAGE_LEN + 1] = "";
 CrkEvent      crkQueue[CRK_QUEUE_MAX];
 uint8_t       crkQueueLen     = 0;
-CrkPart       crkParts[CRK_PARTS];
-bool          crkPartsLive    = false;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Live scores over Wi-Fi, without a PC. Besides running its own access point
@@ -1574,6 +1608,12 @@ static const CrkGlyph CRK_FONT[] = {
   {'.', 1, {0b0, 0b0, 0b0, 0b0, 0b1}},
   {'!', 1, {0b1, 0b1, 0b1, 0b0, 0b1}},
   {':', 1, {0b0, 0b1, 0b0, 0b1, 0b0}},
+  {CRK_ICON_BALL,   5, {0b01110, 0b11011, 0b11011, 0b11011, 0b01110}},   // ball with its seam
+  {CRK_ICON_TARGET, 5, {0b01110, 0b10001, 0b10101, 0b10001, 0b01110}},
+  {CRK_ICON_BAT,    5, {0b00001, 0b00010, 0b01100, 0b11100, 0b11000}},
+  {CRK_ICON_RATE,   5, {0b00001, 0b00001, 0b00101, 0b00101, 0b10101}},   // run rate bars
+  {CRK_NARROW_M,    3, {0b101, 0b111, 0b111, 0b101, 0b101}},             // for a team block that is too wide
+  {CRK_NARROW_W,    3, {0b101, 0b101, 0b111, 0b111, 0b101}},
 };
 
 static const CrkGlyph *crkGlyph(char c) {
@@ -1611,10 +1651,6 @@ static void crkDrawText(uint8_t *layer, const char *s, int x, int y, bool tight)
     }
     x += g->w + 1;
   }
-}
-
-static void crkCentered(const char *s, int y) {
-  crkDrawText(eyesFb, s, (32 - crkTextWidth(s, false)) / 2, y, false);
 }
 
 static void crkFill()   { memset(eyesFb, 0xFF, sizeof(eyesFb)); }
@@ -1703,38 +1739,39 @@ static bool crkAnimSix(unsigned long t) {
   return false;
 }
 
-// WICKET: the ball hits the stumps, they fly apart, then OUT! flashes.
+// WICKET: the ball hops in and tips the bails off, then OUT! drops in letter
+// by letter, each one landing with a little hop.
 static bool crkAnimWicket(unsigned long t) {
   static const int8_t STUMP_X[3] = {24, 26, 28};
-  if (t < 700) {
-    for (int s = 0; s < 3; s++) {
-      for (int y = 2; y < 8; y++) fbSet(STUMP_X[s], y);
+  if (t < 1500) {
+    const bool hit    = (t >= 900);
+    const int  wobble = (hit && t < 1300) ? ((((t - 900) / 70) & 1) ? 1 : -1) : 0;        // the stumps shiver
+    for (int i = 0; i < 3; i++) {
+      for (int y = 2; y < 8; y++) fbSet(STUMP_X[i] + wobble, y);
     }
-    fbSet(25, 1); fbSet(27, 1);                                   // bails
-    const float bx = -2.0f + 24.0f * (t / 700.0f);
-    crkBall(bx, 4);
-    for (int i = 1; i <= 3; i++) fbSet((int)bx - 2 * i, 5 - (i & 1));
-  } else if (t < 1800) {
-    if (!crkPartsLive) {
-      crkPartsLive = true;
-      uint8_t n = 0;
-      for (int s = 0; s < 3; s++) {
-        for (int y = 2; y < 8; y++) {
-          crkParts[n++] = { (float)STUMP_X[s], (float)y, random(-90, 60) / 100.0f, -random(10, 110) / 100.0f };
-        }
+    if (!hit) {
+      fbSet(25, 1); fbSet(27, 1);                                                 // bails
+      const float u = t / 900.0f;
+      crkBall(-2.0f + 23.0f * u, 6.0f - 4.0f * fabsf(sinf(u * 3.0f * (float)PI)));   // three hops
+    } else {
+      const float s = (t - 900) / 600.0f;
+      const int   y = (int)roundf(1.0f - 12.0f * s + 18.0f * s * s);
+      fbSet((int)roundf(25.0f - 5.0f * s), y);                                    // bails pop up and tumble away
+      fbSet((int)roundf(27.0f + 4.0f * s), y);
+      crkBall(21.0f - 3.0f * s, 6.0f);
+    }
+  } else if (t < 3000) {
+    static const char WORD[] = "OUT!";
+    int x = (32 - crkTextWidth(WORD, false)) / 2;
+    for (int i = 0; WORD[i]; i++) {
+      const long lt = (long)t - 1500 - i * 150;                                   // each letter drops in turn
+      const char letter[2] = { WORD[i], '\0' };
+      if (lt >= 0) {
+        const int y = (lt < 200) ? -5 + (int)(lt * 7 / 200) : (lt < 280) ? 2 : (lt < 360) ? 0 : 1;   // fall, squash, hop, settle
+        crkDrawText(eyesFb, letter, x, y, false);
       }
-      crkParts[n++] = { 25.0f, 1.0f, -0.5f, -2.0f };
-      crkParts[n++] = { 27.0f, 1.0f,  0.7f, -2.2f };
+      x += crkGlyph(WORD[i])->w + 1;
     }
-    if (t < 790) crkFill();                                       // impact flash
-    for (uint8_t i = 0; i < CRK_PARTS; i++) {
-      CrkPart &p = crkParts[i];
-      p.x += p.vx; p.y += p.vy; p.vy += 0.09f;
-      if (t >= 790) fbSet((int)roundf(p.x), (int)roundf(p.y));
-    }
-  } else if (t < 3700) {
-    crkCentered("OUT!", 1);
-    if (((t - 1800) / 240) & 1) crkInvert();
   } else {
     return true;
   }
@@ -1790,77 +1827,283 @@ static bool crkRunAnim(unsigned long now) {
   }
 }
 
-// Put page `crkPage` on the display. With `slide` the old page slides up and
-// out while the new one comes in from below.
-static void crkBeginPage(unsigned long now, bool slide) {
+// Swap the label of a page for a small icon where that reads better.
+static void crkDecorate(const char *text, char *out, size_t outLen) {
+  char         tmp[sizeof(crkDraw)];
+  const size_t n = strlen(text);
+  if (!strncmp(text, "OV ", 3)) {
+    snprintf(out, outLen, "%c%s", CRK_ICON_BALL, text + 2);
+    return;
+  }
+  if (!strncmp(text, "CRR ", 4)) {
+    snprintf(out, outLen, "%c%s", CRK_ICON_RATE, text + 3);
+    return;
+  }
+  if (!strncmp(text, "NEED ", 5) || (n && text[n - 1] == '*')) {
+    snprintf(tmp, sizeof(tmp), "%c %s", (text[n - 1] == '*') ? CRK_ICON_BAT : CRK_ICON_TARGET, text);
+    if (crkTextWidth(tmp, true) <= 32) {
+      strlcpy(out, tmp, outLen);
+      return;
+    }
+  }
+  strlcpy(out, text, outLen);
+}
+
+// Tall digits for the score: 4 columns by 7 rows, leftmost pixel first
+static const uint8_t CRK_BIG[10][7] = {
+  {0b0110, 0b1001, 0b1001, 0b1001, 0b1001, 0b1001, 0b0110},
+  {0b0010, 0b0110, 0b0010, 0b0010, 0b0010, 0b0010, 0b0111},
+  {0b0110, 0b1001, 0b0001, 0b0010, 0b0100, 0b1000, 0b1111},
+  {0b1110, 0b0001, 0b0001, 0b0110, 0b0001, 0b0001, 0b1110},
+  {0b0010, 0b0110, 0b1010, 0b1010, 0b1111, 0b0010, 0b0010},
+  {0b1111, 0b1000, 0b1110, 0b0001, 0b0001, 0b1001, 0b0110},
+  {0b0110, 0b1000, 0b1000, 0b1110, 0b1001, 0b1001, 0b0110},
+  {0b1111, 0b0001, 0b0010, 0b0010, 0b0100, 0b0100, 0b0100},
+  {0b0110, 0b1001, 0b1001, 0b0110, 0b1001, 0b1001, 0b0110},
+  {0b0110, 0b1001, 0b1001, 0b0111, 0b0001, 0b0001, 0b0110},
+};
+
+// "IND 187/4" or "IND 187" -> team, runs, wickets (-1 = none given). False if
+// the page is not a score, or the runs do not fit three tall digits.
+static bool crkParseScore(const char *s, char *team, size_t teamLen, int &runs, int &wkts) {
+  const char *sp = strrchr(s, ' ');
+  if (!sp || sp == s) return false;
+  const char *r = sp + 1;
+  int n = 0;
+  runs = 0;
+  wkts = -1;
+  while (r[n] >= '0' && r[n] <= '9') {
+    runs = runs * 10 + (r[n] - '0');
+    if (++n > 3) return false;
+  }
+  if (n == 0) return false;
+  if (r[n]) {
+    if (r[n] != '/' || r[n + 1] < '0' || r[n + 1] > '9' || r[n + 2]) return false;
+    wkts = r[n + 1] - '0';
+  }
+  size_t len = (size_t)(sp - s);
+  if (len >= teamLen) len = teamLen - 1;
+  memcpy(team, s, len);
+  team[len] = '\0';
+  return true;
+}
+
+// The same digits 3 columns wide, for a three digit score that has to leave
+// room for "/wickets"
+static const uint8_t CRK_BIG3[10][7] = {
+  {0b111, 0b101, 0b101, 0b101, 0b101, 0b101, 0b111},
+  {0b010, 0b110, 0b010, 0b010, 0b010, 0b010, 0b111},
+  {0b111, 0b001, 0b001, 0b111, 0b100, 0b100, 0b111},
+  {0b111, 0b001, 0b001, 0b111, 0b001, 0b001, 0b111},
+  {0b101, 0b101, 0b101, 0b111, 0b001, 0b001, 0b001},
+  {0b111, 0b100, 0b100, 0b111, 0b001, 0b001, 0b111},
+  {0b111, 0b100, 0b100, 0b111, 0b101, 0b101, 0b111},
+  {0b111, 0b001, 0b001, 0b010, 0b010, 0b010, 0b010},
+  {0b111, 0b101, 0b101, 0b111, 0b101, 0b101, 0b111},
+  {0b111, 0b101, 0b101, 0b111, 0b001, 0b001, 0b111},
+};
+
+static void crkDrawBig(uint8_t *layer, int digit, int x, int y, bool narrow) {
+  const int      w    = narrow ? 3 : 4;
+  const uint8_t *rows = narrow ? CRK_BIG3[digit] : CRK_BIG[digit];
+  for (int r = 0; r < 7; r++) {
+    for (int c = 0; c < w; c++) {
+      if (!((rows[r] >> (w - 1 - c)) & 1)) continue;
+      const int px = x + c, py = y + r;
+      if (px >= 0 && px < 32 && py >= 0 && py < 8) layer[px] |= (uint8_t)(1 << py);
+    }
+  }
+}
+
+// The score screen: team name top left (the over dots go under it), runs in
+// tall digits, then a tall slash and the wickets as a small digit: "187/4".
+//   with wickets:    x 0..10 team | ..23 runs | 25..27 slash | 29..31 wickets
+//   without wickets: x 0..10 team | ..25 runs
+// Three digits next to a slash are drawn 3 columns wide so that all of it fits.
+static void crkDrawDash(uint8_t *layer) {
+  char team[sizeof(crkDashTeam)];
+  strlcpy(team, crkDashTeam, sizeof(team));
+  if (crkTextWidth(team, true) > 11) {
+    for (char *c = team; *c; c++) {
+      if (*c == 'M') *c = CRK_NARROW_M;
+      else if (*c == 'W') *c = CRK_NARROW_W;
+    }
+  }
+  size_t len = strlen(team);
+  while (len > 1 && crkTextWidth(team, true) > 11) team[--len] = '\0';
+  crkDrawText(layer, team, (11 - crkTextWidth(team, true)) / 2, 0, true);
+
+  char digits[8];
+  snprintf(digits, sizeof(digits), "%d", crkDashRuns);
+  const int  count   = (int)strlen(digits);
+  const bool hasWkts = (crkDashWkts >= 0);
+  const bool narrow  = hasWkts && count >= 3;
+  const int  step    = narrow ? 4 : 5;
+  int x = (hasWkts ? 24 : 26) - (count * step - 1);
+  for (const char *d = digits; *d; d++) {
+    crkDrawBig(layer, *d - '0', x, 0, narrow);
+    x += step;
+  }
+  if (hasWkts) {
+    layer[27] |= 0b00000011;   // slash: rows 0..1, 2..4 and 5..6, one column each
+    layer[26] |= 0b00011100;
+    layer[25] |= 0b01100000;
+    const char w[2] = { (char)('0' + crkDashWkts), '\0' };
+    crkDrawText(layer, w, 29, 2, false);
+  }
+}
+
+// Everything on the current page that does not move by itself.
+static void crkDrawStatic(uint8_t *layer) {
+  if (crkKind == KIND_DASH) crkDrawDash(layer);
+  else crkDrawText(layer, crkDraw, (32 - crkPageW) / 2, 1, crkTight);
+}
+
+// Put page `crkPage` on the display. how: 0 = just show it, 1 = page change
+// (one of three transitions, in turn), 2 = same page with new content (only
+// the parts that changed roll over, one after another, like an odometer).
+static void crkBeginPage(unsigned long now, uint8_t how) {
   strncpy(crkShown, crkPages[crkPage], CRK_PAGE_LEN);
   crkShown[CRK_PAGE_LEN] = '\0';
   crkPageStartMs = now;
   crkTight       = false;
-  crkPageW       = crkTextWidth(crkShown, false);
-  if (crkPageW > 32) {
-    const int tightW = crkTextWidth(crkShown, true);
-    if (tightW <= 32) { crkTight = true; crkPageW = tightW; }
+  if (crkPage == 0 && crkParseScore(crkShown, crkDashTeam, sizeof(crkDashTeam), crkDashRuns, crkDashWkts)) {
+    crkKind    = KIND_DASH;
+    crkMarquee = false;
+  } else {
+    crkDecorate(crkShown, crkDraw, sizeof(crkDraw));
+    crkPageW = crkTextWidth(crkDraw, false);
+    if (crkPageW > 32) {
+      const int tightW = crkTextWidth(crkDraw, true);
+      if (tightW <= 32) { crkTight = true; crkPageW = tightW; }
+    }
+    crkMarquee = (crkPageW > 32);
+    crkKind    = crkMarquee ? KIND_MARQUEE : KIND_TEXT;
   }
-  crkMarquee = (crkPageW > 32);
-  crkSliding = slide && !crkMarquee;
-  if (crkSliding) {
-    memcpy(crkOldText, crkText, sizeof(crkOldText));
-    crkSlideStartMs = now;
+  crkSliding = false;
+  if (how == 0 || crkMarquee) return;
+
+  uint8_t fresh[32];
+  memset(fresh, 0, sizeof(fresh));
+  crkDrawStatic(fresh);
+  memcpy(crkOldText, crkText, sizeof(crkOldText));
+  crkSlideStartMs = now;
+  if (how == 2) {
+    crkTrans = TRANS_UP;
+    int  group      = -1;
+    bool wasChanged = false;
+    for (int x = 0; x < 32; x++) {
+      const bool changed = fresh[x] != crkText[x];
+      if (changed && !wasChanged) group++;
+      crkColDelay[x] = changed ? (uint16_t)(group * CRK_ROLL_STAGGER_MS) : CRK_NO_ANIM;
+      wasChanged = changed;
+    }
+    if (group < 0) return;
+    crkSlideLen = group * CRK_ROLL_STAGGER_MS + CRK_SLIDE_MS;
+  } else {
+    crkTrans = (CrkTrans)(crkTransCount++ % 3);
+    for (int x = 0; x < 32; x++) {
+      crkColDelay[x] = (crkTrans == TRANS_UP)   ? (uint16_t)(x * CRK_RIPPLE_MS)                  // ripple, left to right
+                     : (crkTrans == TRANS_DOWN) ? (uint16_t)(abs(2 * x - 31) * CRK_DROP_MS)      // drops in, centre first
+                     :                            (uint16_t)(x * CRK_WIPE_STEP_MS);              // a bar wipes across
+    }
+    crkSlideLen = (crkTrans == TRANS_UP)   ? 31 * CRK_RIPPLE_MS + CRK_SLIDE_MS
+                : (crkTrans == TRANS_DOWN) ? 31 * CRK_DROP_MS + CRK_SLIDE_MS
+                :                            31 * CRK_WIPE_STEP_MS + CRK_WIPE_BAR_MS;
   }
+  crkSliding = true;
 }
 
 static void crkRenderPage(unsigned long now) {
   if (crkPageCount == 0) return;
   if (crkPage >= crkPageCount) {
     crkPage = 0;
-    crkBeginPage(now, true);
+    crkBeginPage(now, 1);
   } else if (strcmp(crkPages[crkPage], crkShown) != 0) {
-    crkBeginPage(now, true);                       // the score changed while this page was up
+    crkBeginPage(now, 2);                          // the score changed while this page was up
   }
 
-  const bool          dots    = (crkBalls >= 0);
-  const int           textY   = dots ? 0 : 1;      // the over dots take the bottom row
   const unsigned long elapsed = now - crkPageStartMs;
   bool                done;
 
   memset(crkText, 0, sizeof(crkText));
   if (crkMarquee) {
     const int x = 32 - (int)(elapsed / CRK_SCROLL_MS);
-    crkDrawText(crkText, crkShown, x, textY, false);
+    crkDrawText(crkText, crkDraw, x, 1, false);
     done = (x + crkPageW < 0);
   } else {
-    crkDrawText(crkText, crkShown, (32 - crkPageW) / 2, textY, crkTight);
+    crkDrawStatic(crkText);
     done = elapsed >= ((crkPage == 0) ? CRK_MAIN_PAGE_MS : CRK_PAGE_MS);
   }
 
-  if (crkSliding && now - crkSlideStartMs >= CRK_SLIDE_MS) crkSliding = false;
-  const uint8_t mask = dots ? 0x3F : 0x7F;
-  if (crkSliding) {
-    const int k = (int)((now - crkSlideStartMs) * 7UL / CRK_SLIDE_MS);   // 0..6 rows moved
-    for (int x = 0; x < 32; x++) {
-      eyesFb[x] = (uint8_t)(((crkOldText[x] >> k) | (crkText[x] << (7 - k))) & mask);
+  if (crkSliding && now - crkSlideStartMs >= crkSlideLen) crkSliding = false;
+  for (int x = 0; x < 32; x++) {
+    uint8_t        v = crkText[x];
+    const uint16_t d = crkColDelay[x];
+    if (crkSliding && d != CRK_NO_ANIM) {
+      const unsigned long se = now - crkSlideStartMs;
+      if (se < d) {
+        v = crkOldText[x];                                         // this column has not started yet
+      } else if (crkTrans == TRANS_WIPE) {
+        if (se - d < CRK_WIPE_BAR_MS) v = 0x7F;                    // the bar itself
+      } else if (se - d < CRK_SLIDE_MS) {
+        const int k = (int)((se - d) * 7UL / CRK_SLIDE_MS);
+        v = (crkTrans == TRANS_DOWN) ? (uint8_t)((crkOldText[x] << k) | (crkText[x] >> (7 - k)))
+                                     : (uint8_t)((crkOldText[x] >> k) | (crkText[x] << (7 - k)));
+      }
     }
-  } else {
-    for (int x = 0; x < 32; x++) eyesFb[x] = crkText[x] & mask;
+    eyesFb[x] = v & 0x7F;
   }
 
-  // Over dots: six dashes on the bottom row, one per ball bowled this over
-  if (dots) {
-    if (crkWiping  && now - crkWipeMs    >= 700)  crkWiping  = false;
-    if (crkNewBall && now - crkNewBallMs >= 1500) crkNewBall = false;
-    for (int i = 0; i < 6; i++) {
-      bool lit = (i < crkBalls);
-      if (crkWiping) {
-        lit = (i >= (int)((now - crkWipeMs) / 100));              // the finished over sweeps away
-      } else if (lit && crkNewBall && i == crkBalls - 1) {
-        lit = (((now - crkNewBallMs) / 150) & 1) == 0;            // the latest ball blinks
-      }
-      if (lit) {
-        for (int x = 2 + 5 * i; x < 6 + 5 * i; x++) fbSet(x, 7);
+  // A slanted highlight sweeps across the score page once each time it is up
+  if (crkPage == 0 && !crkMarquee && !crkSliding && elapsed >= CRK_SHINE_AT_MS && elapsed < CRK_SHINE_AT_MS + CRK_SHINE_MS) {
+    const int pos = -4 + (int)((elapsed - CRK_SHINE_AT_MS) * 40UL / CRK_SHINE_MS);
+    for (int y = 0; y < 7; y++) {
+      for (int dx = 0; dx < 2; dx++) {
+        const int x = pos + dx + ((6 - y) >> 1);
+        if (x >= 0 && x < 32) eyesFb[x] ^= (uint8_t)(1 << y);
       }
     }
   }
+
+  if (crkKind == KIND_DASH) {
+    // Runs just scored: "+N" takes the place of the team name for a moment
+    if (crkPop && now - crkPopMs >= CRK_POP_MS) crkPop = false;
+    if (crkPop) {
+      const unsigned long t = now - crkPopMs;
+      for (int x = 0; x < 11; x++) eyesFb[x] &= (uint8_t)~0x1F;
+      if (t >= 480 || ((t / 120) & 1) == 0) {                      // flickers in, then holds
+        uint8_t pop[32];
+        char    text[8];
+        memset(pop, 0, sizeof(pop));
+        snprintf(text, sizeof(text), "+%d", crkPopVal);
+        crkDrawText(pop, text, (11 - crkTextWidth(text, false)) / 2, (t < 150) ? 5 - (int)(t * 5 / 150) : 0, false);
+        for (int x = 0; x < 11; x++) eyesFb[x] |= pop[x] & 0x1F;
+      }
+    }
+
+    // Over dots under the team name: one per ball bowled this over
+    if (crkBalls >= 0) {
+      if (crkWiping  && now - crkWipeMs    >= 700)  crkWiping  = false;
+      if (crkNewBall && now - crkNewBallMs >= 1500) crkNewBall = false;
+      for (int x = 0; x < 11; x++) eyesFb[x] &= 0x3F;
+      for (int i = 0; i < 6; i++) {
+        bool lit = (i < crkBalls);
+        if (crkWiping) {
+          lit = (i >= (int)((now - crkWipeMs) / 100));              // the finished over sweeps away
+        } else if (lit && crkNewBall && i == crkBalls - 1) {
+          lit = (((now - crkNewBallMs) / 150) & 1) == 0;            // the latest ball blinks
+        }
+        if (lit) { fbSet(2 * i, 6); fbSet(2 * i, 7); }
+      }
+      if (!crkWiping && crkBalls < 6 && ((now / 150) & 3) == 0) fbSet(2 * crkBalls, 7);   // next ball
+    }
+  }
+
+  // Brightness kicks up when runs are scored and settles back
+  crkIntensity = CRK_BASE_INTENSITY;
+  if (crkGlow && now - crkGlowMs >= CRK_GLOW_MS) crkGlow = false;
+  if (crkGlow) crkIntensity += (uint8_t)(CRK_GLOW_BOOST * (CRK_GLOW_MS - (now - crkGlowMs)) / CRK_GLOW_MS);
 
   if (done) {
     const uint8_t next = (uint8_t)((crkPage + 1) % crkPageCount);
@@ -1868,25 +2111,25 @@ static void crkRenderPage(unsigned long now) {
       crkPageStartMs = now;                        // a single page that fits just stays up
     } else {
       crkPage = next;
-      crkBeginPage(now, true);
+      crkBeginPage(now, 1);
     }
   }
 }
 
 static void cricketTick(unsigned long now) {
   memset(eyesFb, 0, sizeof(eyesFb));
+  if (crkAnim != ANIM_NONE || crkQueueLen > 0) crkIntensity = CRK_BASE_INTENSITY;
 
   if (crkAnim != ANIM_NONE && crkRunAnim(now)) {
     crkAnim = ANIM_NONE;                           // finished: back to the score page
     memset(eyesFb, 0, sizeof(eyesFb));
     memset(crkText, 0, sizeof(crkText));
     crkPage = 0;
-    crkBeginPage(now, false);
+    crkBeginPage(now, 0);
   }
   if (crkAnim == ANIM_NONE && crkQueueLen > 0) {
     crkAnim        = crkQueue[0].anim;
     crkAnimStartMs = now;
-    crkPartsLive   = false;
     memcpy(crkAnimText, crkQueue[0].text, sizeof(crkAnimText));
     crkQueueLen--;
     memmove(&crkQueue[0], &crkQueue[1], crkQueueLen * sizeof(CrkEvent));
@@ -1894,6 +2137,11 @@ static void cricketTick(unsigned long now) {
     crkRunAnim(now);
   }
   if (crkAnim == ANIM_NONE) crkRenderPage(now);
+
+  if (crkIntensity != crkIntensityShown) {
+    mx->control(MD_MAX72XX::INTENSITY, crkIntensity);
+    crkIntensityShown = crkIntensity;
+  }
 
   if (eyesDirty || memcmp(eyesFb, eyesLastFb, sizeof(eyesFb)) != 0) eyesPushFrame();
 }
@@ -1907,13 +2155,14 @@ static void startCricket() {
   crkQueueLen    = 0;
   crkPage        = 0;
   memset(crkText, 0, sizeof(crkText));
-  crkBeginPage(millis(), false);
+  crkBeginPage(millis(), 0);
   Serial.println("Mode: cricket");
 }
 
 static void stopCricket() {
   crkActive    = false;
   crkPageCount = 0;
+  crkRuns      = -1;
   crkQueueLen  = 0;
   crkAnim      = ANIM_NONE;
   if (mode == MODE_CRICKET) {
@@ -1964,6 +2213,15 @@ static bool cricketSet(const char *payload, bool fromNet = false) {
     crkNewBall = true; crkNewBallMs = now;
   }
   memcpy(crkPages, pages, sizeof(crkPages));
+  char scoreTeam[CRK_PAGE_LEN + 1];
+  int  scoreRuns, scoreWkts;
+  const bool isScore = crkParseScore(pages[0], scoreTeam, sizeof(scoreTeam), scoreRuns, scoreWkts);
+  if (isScore && crkRuns >= 0 && !strcmp(scoreTeam, crkRunsTeam) && scoreRuns > crkRuns && scoreRuns - crkRuns <= 9) {
+    crkPop  = true; crkPopVal = scoreRuns - crkRuns; crkPopMs = now;   // "+N" and a brightness kick
+    crkGlow = true; crkGlowMs = now;
+  }
+  crkRuns = isScore ? scoreRuns : -1;
+  strlcpy(crkRunsTeam, isScore ? scoreTeam : "", sizeof(crkRunsTeam));
   crkPageCount    = count;
   crkBalls        = (int8_t)balls;
   crkLastUpdateMs = now;
@@ -2094,13 +2352,29 @@ static void netRequestStop() {
 struct NetReader {
   WiFiClient   &client;
   unsigned long deadline;
+  size_t        count = 0;
+  uint8_t       buf[512];             // one socket read per 512 bytes: a read per byte is ~1 ms each
+  size_t        pos = 0, len = 0;
+  unsigned      fills = 0, idles = 0;   // diagnostics
 
   int read() {
-    while (!client.available()) {
+    while (pos >= len) {
+      const int avail = client.available();
+      if (avail > 0) {
+        const int got = client.read(buf, avail < (int)sizeof(buf) ? avail : (int)sizeof(buf));
+        if (got > 0) {
+          pos = 0;
+          len = (size_t)got;
+          fills++;
+          break;
+        }
+      }
       if (!client.connected() || (long)(millis() - deadline) >= 0) return -1;
+      idles++;
       vTaskDelay(pdMS_TO_TICKS(5));
     }
-    return client.read();
+    count++;
+    return buf[pos++];
   }
   size_t readBytes(char *buf, size_t len) {
     size_t n = 0;
@@ -2116,7 +2390,10 @@ struct NetReader {
 // GET http://host/path and parse the JSON reply, keeping only what `filter` names.
 static bool netGetJson(const char *host, const String &path, JsonDocument &doc, const JsonDocument &filter) {
   WiFiClient client;
-  if (!client.connect(host, 80, 6000)) return false;
+  if (!client.connect(host, 80, 6000)) {
+    Serial.printf("Net: connect to %s failed\n", host);
+    return false;
+  }
   client.print(String("GET ") + path + " HTTP/1.0\r\nHost: " + host +
                "\r\nUser-Agent: Mozilla/5.0\r\nAccept: application/json\r\nConnection: close\r\n\r\n");
 
@@ -2129,6 +2406,9 @@ static bool netGetJson(const char *host, const String &path, JsonDocument &doc, 
   }
   statusLine[n] = '\0';
   bool ok = (n >= 12 && strncmp(statusLine, "HTTP/1.", 7) == 0 && strncmp(statusLine + 9, "200", 3) == 0);
+  if (!ok) Serial.printf("Net: bad status line \"%s\" fills=%u idles=%u connected=%d timed out=%d\n", statusLine,
+                         reader.fills, reader.idles, client.connected() ? 1 : 0,
+                         (long)(millis() - reader.deadline) >= 0 ? 1 : 0);
 
   int lineLen = 0;                                  // skip the headers, up to the blank line
   while (ok) {
@@ -2141,6 +2421,9 @@ static bool netGetJson(const char *host, const String &path, JsonDocument &doc, 
     const DeserializationError err = deserializeJson(doc, reader, DeserializationOption::Filter(filter),
                                                      DeserializationOption::NestingLimit(16));
     ok = !err;
+    if (err) Serial.printf("Net: JSON error %s after %u body bytes, fills=%u idles=%u, connected=%d, timed out=%d\n", err.c_str(),
+                           (unsigned)reader.count, reader.fills, reader.idles, client.connected() ? 1 : 0,
+                           (long)(millis() - reader.deadline) >= 0 ? 1 : 0);
   }
   client.stop();
   return ok;
@@ -2788,7 +3071,7 @@ void setup() {
 
   // LED matrix
   P.begin();
-  P.setIntensity(5);
+  P.setIntensity(CRK_BASE_INTENSITY);
   mx = P.getGraphicObject();
   eyeL.init(EYE_GAP_LEFT - EYE_W, (8 - EYE_H) / 2, EYE_W, EYE_H);
   eyeR.init(EYE_GAP_RIGHT,        (8 - EYE_H) / 2, EYE_W, EYE_H);
@@ -3144,6 +3427,12 @@ void loop() {
   if (crkActive && now - crkLastUpdateMs > CRK_STALE_MS) {
     Serial.println("Cricket: no update from the PC, leaving the scoreboard");
     stopCricket();
+  }
+
+  // The scoreboard plays with the brightness; put it back for everything else
+  if (mode != MODE_CRICKET && crkIntensityShown != CRK_BASE_INTENSITY) {
+    mx->control(MD_MAX72XX::INTENSITY, CRK_BASE_INTENSITY);
+    crkIntensity = crkIntensityShown = CRK_BASE_INTENSITY;
   }
 
   switch (mode) {
