@@ -1,4 +1,4 @@
-# Reed: an ESP32-C3 LED matrix with scrolling text, animated eyes, a countdown bar, a break nagger and live cricket scores
+# Spidy Cricket Tracker: an ESP32-C3 LED matrix with live cricket scores, animated eyes, scrolling text, a countdown bar and a break nagger
 
 A tiny desk gadget built from an **ESP32-C3** and a **4-module MAX7219 LED matrix** (32 x 8 red dots). It makes its own Wi-Fi network, so you control it from your phone with no app and no router. Over the USB cable it can also nag you to take a break when you have been at the PC too long.
 
@@ -7,7 +7,7 @@ A tiny desk gadget built from an **ESP32-C3** and a **4-module MAX7219 LED matri
 | Feature | What you see |
 |---------|--------------|
 | 🔤 Scrolling text | Any message you type, at any speed |
-| 👀 Animated eyes | Two eyes that look left, look right and blink |
+| 👀 Animated eyes | Two eyes that look left, look right and blink, in four styles: classic, round, outline and robot |
 | ⏳ Countdown timer | Stand the strip upright: it fills up LED by LED and is full exactly when time is up, then flashes |
 | 💻 Break monitor | A script on your PC watches your keyboard and mouse. After 15 minutes of work the matrix flashes and scrolls *BITCH TAKE A BREAK* until you walk away for 3 minutes |
 | 🏏 Cricket scoreboard | The live score of an international match: score, overs, chase and batters, with an animation for every four, six, wicket, fifty, hundred and the result. The board fetches it by itself over your home Wi-Fi, or a script on your PC sends it over USB |
@@ -108,8 +108,8 @@ You should see something like `PlatformIO Core, version 6.x`. If the command is 
 
 ```bash
 # 1. Download the project
-git clone https://github.com/gokulraj381/Reed.git
-cd Reed
+git clone https://github.com/gokulraj381/spidy---cricket-tracker.git
+cd spidy---cricket-tracker
 
 # 2. Build (the first time takes a few minutes while the toolchain downloads)
 pio run
@@ -171,7 +171,7 @@ If the self-test looks wrong on the strip, jump to [Troubleshooting the display]
 | Card | What to do |
 |------|------------|
 | **ESP32 LED Matrix Control** | Type a message, pick a scroll speed (10 to 500 ms per step), tap *Display Message*. |
-| **Eyes** | Tap *Show Eyes*. The strip lies flat, connector on the right. The pupils glide left, hold two seconds, glide right, and the eyes blink now and then. *Show Text* switches back. Whichever you chose last is the resting screen and comes back after a timer, even after a power cycle. |
+| **Eyes** | Pick a style: *Classic*, *Round*, *Outline* or *Robot*. The strip lies flat, connector on the right. The pupils glide left, hold two seconds, glide right, and the eyes blink now and then. The robot style looks left, looks right, returns to the centre and blinks twice in a loop of about five seconds. The style is saved on the board. *Show Text* switches back. Whichever you chose last is the resting screen and comes back after a timer, even after a power cycle. |
 | **Break Monitor** | *Test Alert* shows the break message for 10 seconds. *Dismiss* clears a running alert. The real thing is driven from your PC, see section 7. |
 | **Cricket Score** | Shows what the scoreboard is displaying. *Demo Score* puts a sample score up for 3 minutes, and the *Four*, *Six*, *Wicket*, *Fifty*, *Hundred* and *Win* buttons preview each animation. The live score comes over Wi-Fi or from your PC, see section 8. |
 | **Live Scores over Wi-Fi** | Enter your home Wi-Fi name and password and tap *Save Wi-Fi*. The board joins it and shows live international scores with no PC. Optionally name one team to follow. See section 8. |
@@ -324,7 +324,7 @@ Every control is a plain `GET`, so `curl` or any automation works while you are 
 |----------|------------|--------|
 | `/` | – | The control page |
 | `/setText` | `text` (1–127 chars), `speed` (10–500 ms) | Set the scrolling message and make text the resting screen |
-| `/eyes` | – | Show the eyes and make them the resting screen |
+| `/eyes` | optional `style` (0 classic, 1 round, 2 outline, 3 robot; omitted = the saved style) | Show the eyes and make them the resting screen |
 | `/showText` | – | Show the text and make it the resting screen |
 | `/startTimer` | `seconds` (1–86400), optional `flip` (`0`/`1`) | Start the countdown bar |
 | `/cancelTimer` | – | Stop the timer |
@@ -337,7 +337,7 @@ Every control is a plain `GET`, so `curl` or any automation works while you are 
 | `/cricketAuto` | `on` (`0`/`1`), optional `team` | Switch live scores over Wi-Fi on or off, and optionally follow one team only |
 | `/selftest` | – | Run the 9-step display test |
 | `/setModule` | `type` (0–7) | Set the module wiring variant, saved in flash |
-| `/status` | – | JSON with `mode` (`text`/`eyes`/`alert`/`timer`/`done`/`selftest`/`cricket`), `remaining`, `total`, `flip`, `text`, `speed`, `module`, `step`, `idle`, `alert`, `cricket`, `wifi`, `wifiState`, `auto`, `team`, `net` |
+| `/status` | – | JSON with `mode` (`text`/`eyes`/`alert`/`timer`/`done`/`selftest`/`cricket`), `remaining`, `total`, `flip`, `text`, `speed`, `module`, `eyeStyle`, `step`, `idle`, `alert`, `cricket`, `wifi`, `wifiState`, `auto`, `team`, `net` |
 
 Example, a 5-minute timer:
 
